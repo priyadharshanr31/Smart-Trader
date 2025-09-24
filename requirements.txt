@@ -1,0 +1,18 @@
+streamlit>=1.37
+pydantic>=2.8
+python-dotenv>=1.0
+pandas>=2.2
+yfinance>=0.2.43
+pyarrow>=17.0
+requests>=2.32
+sentence-transformers>=3.0
+scikit-learn>=1.5
+numpy>=1.26
+alpaca-trade-api>=3.2
+
+# LangChain + Gemini
+langchain>=0.2.9
+langchain-core>=0.2.17
+langchain-community>=0.2.9
+langchain-google-genai>=1.0.6
+google-generativeai>=0.7
