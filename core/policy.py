@@ -1,78 +1,68 @@
 # core/policy.py
 from __future__ import annotations
-from typing import Dict, Tuple
-import pandas as pd
+from datetime import datetime, timezone
+from typing import List
+from config import settings
 
-# Enter vs Exit thresholds (you can tune these)
-ENTER_TH = 0.60   # stricter to open positions
-EXIT_TH  = 0.45   # easier to exit (protect capital)
+# ----- $ caps -----
 
-def _macro_vote(votes: list[dict]) -> dict | None:
-    return next((v for v in votes if v["agent"] == "LongTerm"), None)
+def cash_floor_remaining(cash: float, equity: float) -> float:
+    """Dollars available above the cash floor (≥40% equity kept as cash)."""
+    reserve = settings.CASH_FLOOR_PCT * float(equity or 0.0)
+    return max(0.0, float(cash or 0.0) - reserve)
 
-def entry_policy(final_side: str,
-                 final_conf: float,
-                 df_30m: pd.DataFrame,
-                 df_daily: pd.DataFrame,
-                 votes: list[Dict]) -> Tuple[bool, str]:
-    """
-    Confluence gates before opening a position:
-      - debate confidence >= ENTER_TH
-      - daily trend filter (20DMA) + RSI(14)
-      - 30m momentum (MACD vs signal)
-      - macro veto if strongly opposed
-      - avoid buying/selling right at extreme Bollinger bands
-    """
-    if final_side not in ("BUY", "SELL"):
-        return False, "no_action"
+def horizon_trade_cap(horizon: str, equity: float) -> float:
+    pct = float(settings.HORIZON_TRADE_CAP_PCT.get(horizon, 0.02))
+    return max(0.0, pct * float(equity or 0.0))
 
-    if final_conf < ENTER_TH:
-        return False, "low_consensus"
+def per_symbol_cap_remaining(symbol_mv: float, equity: float) -> float:
+    cap = settings.PER_SYMBOL_EXPOSURE_CAP_PCT * float(equity or 0.0)
+    return max(0.0, cap - float(symbol_mv or 0.0))
 
-    # Daily trend context
-    close_d = df_daily['close'].iloc[-1]
-    ma20_d  = df_daily['close'].rolling(20).mean().iloc[-1]
-    rsi_d   = df_daily['rsi'].iloc[-1]
+def compute_allowed_notional(horizon: str, cash: float, equity: float, symbol_mv: float) -> float:
+    """Dollar notional allowed for a BUY according to caps."""
+    return min(
+        cash_floor_remaining(cash, equity),
+        horizon_trade_cap(horizon, equity),
+        per_symbol_cap_remaining(symbol_mv, equity),
+    )
 
-    # 30m momentum + stretch
-    macd_30 = df_30m['macd'].iloc[-1]
-    sig_30  = df_30m['macd_signal'].iloc[-1]
-    px_30   = df_30m['close'].iloc[-1]
-    up_30   = df_30m['upper_band'].iloc[-1]
-    lo_30   = df_30m['lower_band'].iloc[-1]
+# ----- share caps & throttles -----
 
-    # Macro veto (blocks fighting the regime)
-    macro = _macro_vote(votes)
-    if macro:
-        if final_side == "BUY" and macro["decision"] in ("HOLD", "SELL") and macro["confidence"] >= 0.70:
-            return False, "macro_veto"
-        if final_side == "SELL" and macro["decision"] in ("HOLD", "BUY") and macro["confidence"] >= 0.70:
-            return False, "macro_veto"
+def clamp_qty_by_share_caps(desired_qty: float, current_qty: float) -> float:
+    """Clamp desired order qty by max-per-buy and max total shares per symbol."""
+    desired_qty = min(float(desired_qty), float(settings.MAX_SHARES_PER_BUY))
+    remaining = max(0.0, float(settings.MAX_SHARES_PER_SYMBOL) - float(current_qty or 0.0))
+    return max(0.0, min(desired_qty, remaining))
 
-    if final_side == "BUY":
-        if not (close_d > ma20_d and rsi_d > 50 and macd_30 > sig_30):
-            return False, "no_confluence"
-        if px_30 >= up_30:
-            return False, "stretched_upper"
-    else:  # SELL
-        if not (close_d < ma20_d and rsi_d < 50 and macd_30 < sig_30):
-            return False, "no_confluence"
-        if px_30 <= lo_30:
-            return False, "stretched_lower"
+def too_soon_since_last_buy(symbol: str, runs_for_symbol: List[dict]) -> bool:
+    """Cooldown to avoid back-to-back buys."""
+    now = datetime.now(timezone.utc)
+    for r in runs_for_symbol:
+        if r.get("action") != "BUY":
+            continue
+        try:
+            last = datetime.fromisoformat(r["when"].replace("Z","+00:00"))
+        except Exception:
+            continue
+        if (now - last).total_seconds() / 60.0 < float(settings.REBUY_COOLDOWN_MINUTES):
+            return True
+        break
+    return False
 
-    return True, "ok"
-
-def exit_policy(final_decision: str,
-                final_conf: float,
-                bars_held: int | None = None) -> Tuple[bool, str]:
-    """
-    Minimal exit logic for now: allow agent-driven SELLs with a lower threshold,
-    plus an optional time-based exit (e.g., stale trades).
-    """
-    if final_decision == "SELL" and final_conf >= EXIT_TH:
-        return True, "agent_sell"
-
-    if bars_held is not None and bars_held >= 20:
-        return True, "time_exit"
-
-    return False, "hold"
+def hit_daily_buy_limit(symbol: str, runs_for_symbol: List[dict]) -> bool:
+    """No more than N buy executions per symbol per UTC day."""
+    today = datetime.now(timezone.utc).date()
+    buys = 0
+    for r in runs_for_symbol:
+        if r.get("action") != "BUY":
+            continue
+        try:
+            day = datetime.fromisoformat(r["when"].replace("Z","+00:00")).date()
+        except Exception:
+            continue
+        if day == today:
+            buys += 1
+            if buys >= int(settings.DAILY_BUY_LIMIT_PER_SYMBOL):
+                return True
+    return False

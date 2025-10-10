@@ -1,3 +1,4 @@
+# core/data_manager.py
 from __future__ import annotations
 import os
 import pandas as pd
@@ -6,6 +7,16 @@ import yfinance as yf
 from core.indicators import enrich_indicators
 from config import settings
 
+_REQUIRED_INDICATOR_COLS = ["close", "rsi", "macd", "macd_signal", "upper_band", "lower_band"]
+
+def _drop_indicator_nans(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    # Only drop on columns that actually exist, always include 'close'
+    cols = ["close"] + [c for c in _REQUIRED_INDICATOR_COLS if c in df.columns]
+    cols = list(dict.fromkeys(cols))  # unique, keep order
+    return df.dropna(subset=[c for c in cols if c in df.columns])
+
 class DataManager:
     def __init__(self, data_dir: str | None = None):
         self.data_dir = data_dir or settings.data_dir
@@ -13,7 +24,6 @@ class DataManager:
 
     # ----------------------- helpers -----------------------
     def _cache_path(self, symbol: str, kind: str) -> str:
-        # safe filename: replace '/' with '_'
         return os.path.join(self.data_dir, f"{symbol.upper().replace('/', '_')}_{kind}.parquet")
 
     def _is_stale(self, path: str, max_age_minutes: int) -> bool:
@@ -23,7 +33,6 @@ class DataManager:
         return (datetime.now() - mtime) > timedelta(minutes=max_age_minutes)
 
     def _reset_time_column(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Ensure a 'time' column exists
         df = df.reset_index()
         rename_map = {}
         for cand in ["Date", "Datetime", "date", "datetime", df.columns[0]]:
@@ -34,7 +43,6 @@ class DataManager:
         return df
 
     def _ensure_ohlcv(self, df: pd.DataFrame, symbol_for_ticker: str) -> pd.DataFrame:
-        # Normalize column names and ensure required columns
         df.columns = [c.lower().strip() for c in df.columns]
         if "close" not in df.columns and "adj close" in df.columns:
             df["close"] = df["adj close"]
@@ -76,7 +84,6 @@ class DataManager:
 
     # ======================= STOCKS (30m / 1d / 1wk) =======================
     def get_intraday_short(self, symbol: str) -> pd.DataFrame:
-        """Short-term slice: intraday 30m (configurable)."""
         kind = f"{settings.short_interval}"
         path = self._cache_path(symbol, kind)
         if self._is_stale(path, max_age_minutes=15):
@@ -90,10 +97,10 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.short_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def get_daily_mid(self, symbol: str) -> pd.DataFrame:
-        """Mid-term slice: daily bars."""
         path = self._cache_path(symbol, '1d')
         if self._is_stale(path, max_age_minutes=1440):
             df = self._download(symbol, interval='1d', period='5y', display_ticker=symbol)
@@ -106,10 +113,10 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.mid_daily_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def get_weekly_long(self, symbol: str) -> pd.DataFrame:
-        """Long-term slice: weekly bars."""
         path = self._cache_path(symbol, '1wk')
         if self._is_stale(path, max_age_minutes=1440):
             df = self._download(symbol, interval='1wk', period='10y', display_ticker=symbol)
@@ -122,10 +129,10 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.long_weekly_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def layered_snapshot(self, symbol: str) -> dict:
-        """Stocks snapshot."""
         return {
             'short_term': self.get_intraday_short(symbol),
             'mid_term'  : self.get_daily_mid(symbol),
@@ -135,13 +142,6 @@ class DataManager:
     # ======================= CRYPTO (30m / 1d / 1wk) =======================
     @staticmethod
     def _map_crypto_symbol(user_symbol: str) -> tuple[str, str]:
-        """
-        Map user input to (yfinance_symbol, display_symbol).
-        Examples:
-          'BTC/USD' -> ('BTC-USD', 'BTC/USD')
-          'ETHUSD'  -> ('ETH-USD', 'ETH/USD')
-          'SOL-USDT'-> ('SOL-USD', 'SOL/USDT')  # Yahoo best-effort USD
-        """
         norm = user_symbol.upper().replace(" ", "")
         if "/" in norm:
             base, quote = norm.split("/", 1)
@@ -154,7 +154,7 @@ class DataManager:
                 base, quote = norm[:-3], "USD"
             else:
                 base, quote = norm, "USD"
-        y_quote = "USD"  # Yahoo mostly uses '-USD'
+        y_quote = "USD"
         y_symbol = f"{base}-{y_quote}"
         display_symbol = f"{base}/{quote}"
         return y_symbol, display_symbol
@@ -174,7 +174,8 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.short_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def get_daily_mid_crypto(self, user_symbol: str) -> pd.DataFrame:
         y_symbol, display = self._map_crypto_symbol(user_symbol)
@@ -190,7 +191,8 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.mid_daily_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def get_weekly_long_crypto(self, user_symbol: str) -> pd.DataFrame:
         y_symbol, display = self._map_crypto_symbol(user_symbol)
@@ -206,10 +208,10 @@ class DataManager:
                 if not df.empty:
                     df.to_parquet(path, index=False)
         df = df.tail(settings.long_weekly_lookback) if not df.empty else df
-        return enrich_indicators(df)
+        df = enrich_indicators(df)
+        return _drop_indicator_nans(df)
 
     def layered_snapshot_crypto(self, user_symbol: str) -> dict:
-        """Crypto snapshot: 30m / 1d / 1wk slices mapped to BASE-USD for yfinance."""
         return {
             'short_term': self.get_intraday_short_crypto(user_symbol),
             'mid_term'  : self.get_daily_mid_crypto(user_symbol),

@@ -10,6 +10,8 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from ui.automation_panel import render_automation_tab
+
 from config import settings
 from core.data_manager import DataManager
 from core.finnhub_client import FinnhubClient
@@ -24,7 +26,7 @@ from agents.long_term_agent import LongTermAgent
 from agents.suggestions_agent import SuggestionsAgent  # separate suggestions agent
 
 STATE_DIR = "state"
-RUN_LOG = os.path.join(STATE_DIR, "auto_runs.jsonl")  # produced by autonomous_runner
+RUN_LOG = os.path.join(STATE_DIR, "auto_runs.jsonl")
 
 # ------------------------- App bootstrap -------------------------
 load_dotenv()
@@ -64,7 +66,7 @@ st.session_state["keys"].update({
 st.session_state["stocks_watch"] = watchlist_stocks
 st.session_state["crypto_watch"] = watchlist_crypto
 
-# Session state for last analyses per tab
+# Session state for last analyses per tab (now stores horizon-aware decision objects)
 for key in ("analysis_stocks", "analysis_crypto"):
     if key not in st.session_state:
         st.session_state[key] = None
@@ -90,33 +92,18 @@ def _agent_pack():
     dm = DataManager()
     sm = SemanticMemory()
     fh = FinnhubClient(api_key=finnhub_key) if finnhub_key else None
-    llm = LCTraderLLM(gemini_key=gemini_key)
-    debate = Debate(mean_conf_to_act=mean_conf)
+    llm = LCTraderLLM(api_key=gemini_key)  # your current constructor
+    debate = Debate()
     return dm, sm, fh, llm, debate
 
-def _run_agents_on_snapshot(snapshot, sm, llm, debate):
-    short = ShortTermAgent("ShortTerm", llm, {})
-    mid   = MidTermAgent("MidTerm", llm, {})
-    long  = LongTermAgent("LongTerm", llm, {}, sm)
-
-    votes = []
-    d, c, raw = short.vote(snapshot); votes.append({"agent": "ShortTerm", "decision": d, "confidence": c, "raw": raw})
-    d, c, raw = mid.vote(snapshot);   votes.append({"agent": "MidTerm",  "decision": d, "confidence": c, "raw": raw})
-    d, c, raw = long.vote(snapshot);  votes.append({"agent": "LongTerm", "decision": d, "confidence": c, "raw": raw})
-
-    final_decision, final_conf = debate.run(votes)
-    return votes, final_decision, final_conf
-
 def _read_last_runs(n: int = 5) -> List[Dict]:
-    """Read last N entries from the JSONL log written by the autonomous runner."""
     if not os.path.exists(RUN_LOG):
         return []
     try:
         with open(RUN_LOG, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        entries = [pd.json.loads(l) if hasattr(pd, "json") else json.loads(l) for l in lines]  # fallback below
+        entries = [pd.json.loads(l) if hasattr(pd, "json") else json.loads(l) for l in lines]
     except Exception:
-        # simple parser
         entries = []
         with open(RUN_LOG, "r", encoding="utf-8") as f:
             for line in f:
@@ -124,7 +111,6 @@ def _read_last_runs(n: int = 5) -> List[Dict]:
                     entries.append(eval_json(line))
                 except Exception:
                     continue
-    # Fast path using std lib json
     try:
         with open(RUN_LOG, "r", encoding="utf-8") as f:
             entries = [json.loads(l) for l in f if l.strip()]
@@ -199,19 +185,46 @@ with tab_stocks:
             if snapshot["mid_term"].empty:
                 st.error("Could not fetch data for this ticker. Check the symbol or try later.")
                 st.stop()
+
+        # --- Debug: what the model sees
+        with st.expander("🔎 Debug — last 10 rows per horizon (NaN check)"):
+            for label in ("short_term", "mid_term", "long_term"):
+                st.markdown(f"**{label}**")
+                df_dbg = snapshot.get(label)
+                if df_dbg is None or df_dbg.empty:
+                    st.write("(empty)")
+                else:
+                    st.dataframe(df_dbg.tail(10), use_container_width=True, height=220)
+                    needed = ["close","rsi","macd","macd_signal","upper_band","lower_band"]
+                    present = [c for c in needed if c in df_dbg.columns]
+                    if present:
+                        st.caption(f"NaNs present in {label}: {df_dbg.tail(10)[present].isna().any().any()}")
+
         with st.spinner("Fetching news & building semantic memory…"):
             try:
                 if fh:
                     sm.add((fh.company_news(ticker_stk, days=45) or [])[:30])
             except Exception as e:
                 st.warning(f"Finnhub news unavailable: {e}")
-        votes, final_decision, final_conf = _run_agents_on_snapshot(snapshot, sm, llm, debate)
+
+        # agents + horizon-aware debate (🔁 CHANGED: use horizon_decide instead of run)
+        short = ShortTermAgent("ShortTerm", llm, {})
+        mid   = MidTermAgent("MidTerm", llm, {})
+        long  = LongTermAgent("LongTerm", llm, {}, sm)
+
+        votes = []
+        d, c, raw = short.vote(snapshot); votes.append({"agent": "ShortTerm", "decision": d, "confidence": c, "raw": raw})
+        d, c, raw = mid.vote(snapshot);   votes.append({"agent": "MidTerm",  "decision": d, "confidence": c, "raw": raw})
+        d, c, raw = long.vote(snapshot);  votes.append({"agent": "LongTerm", "decision": d, "confidence": c, "raw": raw})
+
+        decision_obj = Debate(enter_th=mean_conf, exit_th=0.45).horizon_decide(votes)
+        # decision_obj = {"action","target_horizon","confidence","scores":{short,mid,long}}
+
         st.session_state["analysis_stocks"] = {
             "ticker": ticker_stk,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "votes": votes,
-            "final_decision": final_decision,
-            "final_confidence": final_conf,
+            "decision": decision_obj,
         }
 
     analysis = st.session_state["analysis_stocks"]
@@ -221,13 +234,27 @@ with tab_stocks:
             st.markdown(f"• **{v['agent']}** → **{v['decision']}** (conf={v['confidence']:.2f})")
             with st.expander("LLM rationale / raw"):
                 st.write(v["raw"])
-        st.markdown(f"### Final: **{analysis['final_decision']}** (confidence **{analysis['final_confidence']:.2f}**)")
+
+        dec = analysis["decision"]
+        horizon_text = dec.get("target_horizon") or "—"
+        st.markdown(
+            f"### Final: **{dec.get('action','HOLD')}** "
+            f"(confidence **{float(dec.get('confidence',0.0)):.2f}**) "
+            f"• Target horizon: **{horizon_text}**"
+        )
+        if isinstance(dec.get("scores"), dict):
+            scores = dec["scores"]
+            st.caption(f"Per-horizon scores: short={scores.get('short',0):.2f}, mid={scores.get('mid',0):.2f}, long={scores.get('long',0):.2f}")
+
         st.divider()
         st.subheader("Place Paper Trade (Stocks)")
-        default_side = analysis["final_decision"] if analysis["final_decision"] in ("BUY", "SELL") else "BUY"
+        # Default side follows horizon-aware action, but you can override
+        default_side = dec.get("action", "HOLD")
+        if default_side not in ("BUY", "SELL"):
+            default_side = "BUY"
         side = st.radio("Order side", ("BUY", "SELL"), index=0 if default_side == "BUY" else 1, horizontal=True, key="stk_side_radio")
-        if side != analysis["final_decision"]:
-            st.caption("⚠️ You are overriding the agents' final decision.")
+        if side != dec.get("action"):
+            st.caption("⚠️ You are overriding the debate decision.")
         qty = st.number_input("Quantity (shares)", min_value=1, value=1, step=1, key="stk_qty_input")
         confirm = st.checkbox(f"I confirm a MARKET {side} for {analysis['ticker']} x {qty}.", key="stk_confirm_checkbox")
         if st.button("Place Order (Stocks)", disabled=not confirm, key="stk_place_btn"):
@@ -259,20 +286,45 @@ with tab_crypto:
             if snapshot["mid_term"].empty:
                 st.error("Could not fetch data for this pair. Try BTC/USD or ETH/USD.")
                 st.stop()
+
+        # --- Debug: what the model sees
+        with st.expander("🔎 Debug — last 10 rows per horizon (NaN check)"):
+            for label in ("short_term", "mid_term", "long_term"):
+                st.markdown(f"**{label}**")
+                df_dbg = snapshot.get(label)
+                if df_dbg is None or df_dbg.empty:
+                    st.write("(empty)")
+                else:
+                    st.dataframe(df_dbg.tail(10), use_container_width=True, height=220)
+                    needed = ["close","rsi","macd","macd_signal","upper_band","lower_band"]
+                    present = [c for c in needed if c in df_dbg.columns]
+                    if present:
+                        st.caption(f"NaNs present in {label}: {df_dbg.tail(10)[present].isna().any().any()}")
+
         with st.spinner("Fetching crypto news & building semantic memory…"):
             try:
                 if fh:
                     sm.add((fh.crypto_news(max_items=50) or [])[:30])
             except Exception as e:
                 st.warning(f"Crypto news unavailable: {e}")
-        votes, final_decision, final_conf = _run_agents_on_snapshot(snapshot, sm, llm, debate)
+
+        # agents + horizon-aware debate (🔁 CHANGED: use horizon_decide instead of run)
+        short = ShortTermAgent("ShortTerm", llm, {})
+        mid   = MidTermAgent("MidTerm", llm, {})
+        long  = LongTermAgent("LongTerm", llm, {}, sm)
+
+        votes = []
+        d, c, raw = short.vote(snapshot); votes.append({"agent": "ShortTerm", "decision": d, "confidence": c, "raw": raw})
+        d, c, raw = mid.vote(snapshot);   votes.append({"agent": "MidTerm",  "decision": d, "confidence": c, "raw": raw})
+        d, c, raw = long.vote(snapshot);  votes.append({"agent": "LongTerm", "decision": d, "confidence": c, "raw": raw})
+
+        decision_obj = Debate(enter_th=mean_conf, exit_th=0.45).horizon_decide(votes)
         display_ticker = snapshot["short_term"]["ticker"].iloc[-1] if not snapshot["short_term"].empty else ticker_c
         st.session_state["analysis_crypto"] = {
             "ticker": display_ticker,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "votes": votes,
-            "final_decision": final_decision,
-            "final_confidence": final_conf,
+            "decision": decision_obj,
         }
 
     analysis_c = st.session_state["analysis_crypto"]
@@ -280,17 +332,28 @@ with tab_crypto:
         st.markdown(f"**Agent Votes — {analysis_c['ticker']}**  \n_{analysis_c['timestamp']}_")
         for v in analysis_c["votes"]:
             st.markdown(f"• **{v['agent']}** → **{v['decision']}** (conf={v['confidence']:.2f})")
-        with st.expander("LLM rationale / raw"):
-            for v in analysis_c["votes"]:
-                st.markdown(f"**{v['agent']}**")
+            with st.expander("LLM rationale / raw"):
                 st.write(v["raw"])
-        st.markdown(f"### Final: **{analysis_c['final_decision']}** (confidence **{analysis_c['final_confidence']:.2f}**)")
+
+        dec = analysis_c["decision"]
+        horizon_text = dec.get("target_horizon") or "—"
+        st.markdown(
+            f"### Final: **{dec.get('action','HOLD')}** "
+            f"(confidence **{float(dec.get('confidence',0.0)):.2f}**) "
+            f"• Target horizon: **{horizon_text}**"
+        )
+        if isinstance(dec.get("scores"), dict):
+            scores = dec["scores"]
+            st.caption(f"Per-horizon scores: short={scores.get('short',0):.2f}, mid={scores.get('mid',0):.2f}, long={scores.get('long',0):.2f}")
+
         st.divider()
         st.subheader("Place Paper Trade (Crypto)")
-        default_side_c = analysis_c["final_decision"] if analysis_c["final_decision"] in ("BUY", "SELL") else "BUY"
+        default_side_c = dec.get("action", "HOLD")
+        if default_side_c not in ("BUY", "SELL"):
+            default_side_c = "BUY"
         side_c = st.radio("Order side", ("BUY", "SELL"), index=0 if default_side_c == "BUY" else 1, horizontal=True, key="c_side_radio")
-        if side_c != analysis_c["final_decision"]:
-            st.caption("⚠️ You are overriding the agents' final decision.")
+        if side_c != dec.get("action"):
+            st.caption("⚠️ You are overriding the debate decision.")
         qty_c = st.number_input("Quantity (crypto units)", min_value=0.0001, value=0.001, step=0.0001, format="%.6f", key="c_qty_input")
         confirm_c = st.checkbox(f"I confirm a MARKET {side_c} for {analysis_c['ticker']} x {qty_c}.", key="c_confirm_checkbox")
         if st.button("Place Order (Crypto)", disabled=not confirm_c, key="c_place_btn"):
@@ -302,79 +365,6 @@ with tab_crypto:
                 st.success(f"✅ Order placed: {side_c} {analysis_c['ticker']} x {qty_c}{px_msg}  \n**Order ID:** `{oid}`")
             except Exception as e:
                 st.error(f"Order failed: {e}")
-
-# =================================================================
-#                     SUGGESTIONS TAB (separate agent)
-# =================================================================
-with tab_suggest:
-    st.subheader("Suggestions (News-Sentiment Agent)")
-    if not (alpaca_key and alpaca_secret and gemini_key and finnhub_key):
-        st.warning("Please provide Alpaca, Gemini and Finnhub API keys to generate suggestions.")
-    else:
-        broker = AlpacaTrader(alpaca_key, alpaca_secret, alpaca_base)
-        fh = FinnhubClient(api_key=finnhub_key)
-        llm = LCTraderLLM(gemini_key=gemini_key)
-
-        wl_stocks = [s.strip().upper() for s in st.session_state["stocks_watch"].split(",") if s.strip()]
-        try:
-            held_syms = set([p["symbol"] for p in broker.list_positions()])
-        except Exception:
-            held_syms = set()
-
-        max_syms = st.slider("Max stocks to scan", 1, 30, 10)
-        min_conf = st.slider("Min confidence to recommend (BUY)", 0.0, 1.0, st.session_state["keys"]["mean_conf"], 0.05)
-
-        if st.button("Generate Suggestions", type="primary"):
-            agent = SuggestionsAgent(llm=llm, finnhub_client=fh, min_conf=min_conf)
-            rows, details_map = [], {}
-            with st.spinner("Analyzing news sentiment and headlines…"):
-                for sym in wl_stocks[:max_syms]:
-                    if sym in held_syms:
-                        continue
-                    try:
-                        res = agent.analyze_symbol(sym)
-                        if res["recommendation"] == "BUY" and res["confidence"] >= min_conf:
-                            rows.append({
-                                "Symbol": res["symbol"],
-                                "Recommendation": res["recommendation"],
-                                "Confidence": round(res["confidence"], 3),
-                                "NewsScore": round(res["companyNewsScore"], 3) if res["companyNewsScore"] is not None else None,
-                                "Bullish%": round(res["bullishPercent"] * 100.0, 2) if res["bullishPercent"] is not None else None,
-                                "Bearish%": round(res["bearishPercent"] * 100.0, 2) if res["bearishPercent"] is not None else None,
-                                "Buzz": round(res["buzz"], 3) if res["buzz"] is not None else None,
-                                "Articles(7d)": res["articlesInLastWeek"],
-                            })
-                            details_map[res["symbol"]] = res
-                    except Exception:
-                        continue
-
-            if rows:
-                st.success(f"Found {len(rows)} BUY suggestions.")
-                df = pd.DataFrame(rows).sort_values(["Confidence", "NewsScore"], ascending=False)
-                st.dataframe(df, use_container_width=True, height=360)
-                sel = st.selectbox("Show details for:", options=["(choose)"] + [r["Symbol"] for r in rows])
-                if sel and sel != "(choose)":
-                    info = details_map.get(sel, {})
-                    st.markdown(f"#### {sel} — Why it’s suggested")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("companyNewsScore", f"{info.get('companyNewsScore', 0):.3f}")
-                    c2.metric("Bullish %", f"{(info.get('bullishPercent', 0)*100):.2f}%")
-                    c3.metric("Bearish %", f"{(info.get('bearishPercent', 0)*100):.2f}%")
-                    c1, c2 = st.columns(2)
-                    c1.metric("Buzz", f"{info.get('buzz', 0):.3f}")
-                    c2.metric("Articles (last week)", f"{info.get('articlesInLastWeek', 0)}")
-                    with st.expander("Recent headlines"):
-                        for h in (info.get("headlines") or []):
-                            headline = h.get("headline") or ""
-                            url = h.get("url") or ""
-                            source = h.get("source") or ""
-                            ts = h.get("datetime")
-                            tstr = pd.to_datetime(ts, unit="s").strftime("%Y-%m-%d %H:%M") if ts else ""
-                            st.markdown(f"- [{headline}]({url})  \n  _{source} • {tstr}_")
-                    with st.expander("LLM raw reasoning"):
-                        st.write(info.get("raw") or "(none)")
-            else:
-                st.info("No strong BUY ideas right now. Try again later or widen your watchlist.")
 
 # =================================================================
 #                         NEWS TAB (Finnhub)
@@ -438,65 +428,4 @@ with tab_news:
 #                        AUTOMATION TAB (NEW)
 # =================================================================
 with tab_auto:
-    st.subheader("Last 5 Automation Runs")
-    st.caption("Shows the most recent activity from the autonomous scheduler (stocks & crypto).")
-    if st.button("Refresh"):
-        st.rerun()
-
-    if not os.path.exists(RUN_LOG):
-        st.info("No automation log yet. Start your scheduler (run_scheduler.py) to generate entries.")
-    else:
-        # Read last 5 entries (most recent first)
-        try:
-            with open(RUN_LOG, "r", encoding="utf-8") as f:
-                lines = [json.loads(l) for l in f if l.strip()]
-        except Exception:
-            lines = []
-            with open(RUN_LOG, "r", encoding="utf-8") as f:
-                for l in f:
-                    try:
-                        lines.append(eval_json(l))
-                    except Exception:
-                        pass
-
-        last = list(reversed(lines[-5:])) if lines else []
-        if not last:
-            st.info("Log exists but contains no entries yet.")
-        else:
-            # Summary table
-            rows = []
-            for e in last:
-                final = (e.get("final") or {})
-                rows.append({
-                    "When": _fmt_when(e.get("_ts", "")),
-                    "Kind": e.get("kind", ""),
-                    "Symbol": e.get("symbol", ""),
-                    "Status": e.get("status", ""),
-                    "Decision": final.get("decision", ""),
-                    "Conf": round(final.get("confidence", 0), 3) if isinstance(final.get("confidence", 0), (int, float)) else final.get("confidence", ""),
-                    "Reason": e.get("reason", ""),
-                    "Order ID": e.get("order_id", ""),
-                    "Qty": e.get("qty", ""),
-                    "Bar Time": e.get("bar_ts", ""),
-                })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, height=300)
-
-            # Details expanders
-            st.markdown("### Details")
-            for i, e in enumerate(last, 1):
-                with st.expander(f"{i}. {e.get('kind','').upper()} {e.get('symbol','')} — {e.get('status','').upper()} @ { _fmt_when(e.get('_ts','')) }"):
-                    st.json({
-                        "status": e.get("status"),
-                        "symbol": e.get("symbol"),
-                        "kind": e.get("kind"),
-                        "bar_ts": e.get("bar_ts"),
-                        "final": e.get("final"),
-                        "reason": e.get("reason"),
-                        "order_id": e.get("order_id"),
-                        "qty": e.get("qty"),
-                        "votes": e.get("votes"),
-                    })
-
-# Footer tip
-st.caption("Pro tip: Update your Watchlist in the sidebar to drive suggestions and news.")
+    render_automation_tab()

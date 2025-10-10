@@ -1,221 +1,240 @@
 # autonomous_runner.py
 from __future__ import annotations
-import os, json, time
+import os, json
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from config import settings
 from core.data_manager import DataManager
-from core.finnhub_client import FinnhubClient
-from core.semantic_memory import SemanticMemory
+from core.debate import Debate, summarize_reason_2lines
 from core.llm import LCTraderLLM
-from core.debate import Debate
+from core.policy import (
+    compute_allowed_notional, clamp_qty_by_share_caps,
+    too_soon_since_last_buy, hit_daily_buy_limit
+)
 from core.trader import AlpacaTrader
-from core.policy import entry_policy, exit_policy
-
+from core.positions import read_ledger, write_ledger, set_timebox_on_entry, merge_entry
+from core.semantic_memory import SemanticMemory
 from agents.short_term_agent import ShortTermAgent
 from agents.mid_term_agent import MidTermAgent
 from agents.long_term_agent import LongTermAgent
-from dotenv import load_dotenv
-load_dotenv()
 
-STATE_DIR  = "state"
-STATE_PATH = os.path.join(STATE_DIR, "last_processed.json")
-LOG_PATH   = os.path.join(STATE_DIR, "auto_runs.jsonl")   # NEW
+STATE_DIR = "state"
+RUN_LOG = os.path.join(STATE_DIR, "auto_runs.jsonl")
 os.makedirs(STATE_DIR, exist_ok=True)
 
-WATCHLIST_STOCKS = [s.strip() for s in os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA").split(",") if s.strip()]
-WATCHLIST_CRYPTO = [s.strip() for s in os.getenv("WATCHLIST_CRYPTO", "BTC/USD,ETH/USD").split(",") if s.strip()]
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
-COOLDOWN_MINUTES     = int(os.getenv("COOLDOWN_MINUTES", "60"))
-ALLOW_SHORTS_STOCKS  = os.getenv("ALLOW_SHORTS_STOCKS", "0") == "1"
-NOTIONAL_STOCK       = float(os.getenv("NOTIONAL_STOCK", "1000"))
-NOTIONAL_CRYPTO      = float(os.getenv("NOTIONAL_CRYPTO", "50"))
+def _append_run(line: Dict[str, Any]) -> None:
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(line) + "\n")
 
-def _load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {"last_bar_ts": {}, "last_trade_ts": {}}
-    with open(STATE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _read_recent_runs(max_lines=500) -> List[dict]:
+    if not os.path.exists(RUN_LOG):
+        return []
+    out: List[dict] = []
+    with open(RUN_LOG, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out[-max_lines:]
 
-def _save_state(state: Dict[str, Any]) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+# ---- timebox enforcement on every cycle ----
+def enforce_timeboxes(trader: AlpacaTrader):
+    ledger = read_ledger()
+    now = datetime.now(timezone.utc)
+    changed = False
+    for sym, meta in list(ledger.items()):
+        tb = meta.get("timebox_until")
+        if not tb:
+            continue
+        try:
+            until = datetime.fromisoformat(tb.replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if now >= until:
+            try:
+                order_id = trader.close_position(sym)
+                _append_run({
+                    "when": _now_iso(), "symbol": sym, "trigger": "timebox_expired",
+                    "action": "FORCED_EXIT",
+                    "reason": f"Timebox expired for {meta.get('horizon')}",
+                    "order_id": order_id,
+                })
+            except Exception as e:
+                _append_run({
+                    "when": _now_iso(), "symbol": sym, "trigger": "timebox_expired",
+                    "action": "FORCED_EXIT_FAILED",
+                    "error": str(e),
+                })
+            ledger.pop(sym, None)
+            changed = True
+    if changed:
+        write_ledger(ledger)
 
-def _append_log(entry: Dict[str, Any]) -> None:
-    """Append one compact JSON line so UI can show recent activity."""
-    try:
-        entry["_ts"] = datetime.now(timezone.utc).isoformat()
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+def run_once(symbol: str,
+             is_crypto: bool = False,
+             trigger: str = "bar_close_30m",
+             news_boost: bool = False) -> Dict[str, Any]:
+    """
+    One full decision cycle for a symbol.
+    - Enforce timeboxes (forced exits)
+    - Build layered data
+    - Get agent votes
+    - Debate → final decision with horizon
+    - Policy: execute SELL immediately, BUY with caps/throttles or log SUGGEST_BUY
+    """
+    sym = symbol.upper()
 
-def _minutes_since(epoch: int) -> float:
-    return (time.time() - epoch) / 60.0
+    # toolbelt
+    trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
 
-def _latest_bar_time(df_30m) -> str | None:
-    if df_30m is None or df_30m.empty:
-        return None
-    return str(df_30m["time"].iloc[-1])
+    # 1) enforce timeboxes first
+    enforce_timeboxes(trader)
 
-def _qty_for_stock(broker: AlpacaTrader, symbol: str) -> int:
-    px = broker.last_price(symbol) or 0.0
-    if px <= 0:
-        return 0
-    return max(1, int(NOTIONAL_STOCK // px))
-
-def _qty_for_crypto(broker: AlpacaTrader, symbol: str) -> float:
-    px = broker.last_price(symbol) or 0.0
-    if px <= 0:
-        return 0.0
-    qty = NOTIONAL_CRYPTO / px
-    return float(f"{qty:.6f}")
-
-def run_once(symbol: str, is_crypto: bool) -> Dict[str, Any]:
-    if os.getenv("AUTO_PAUSED", "0") == "1":
-        out = {"status": "paused", "symbol": symbol}
-        _append_log({"kind": "crypto" if is_crypto else "stock", **out})
-        return out
-
-    state = _load_state()
-    last_bar_ts = state.get("last_bar_ts", {})
-    last_trade  = state.get("last_trade_ts", {})
-
+    # 2) data + agents
     dm = DataManager()
-    sm = SemanticMemory()
-    fh = FinnhubClient(api_key=settings.finnhub_key) if settings.finnhub_key else None
-    llm = LCTraderLLM(gemini_key=settings.gemini_key)
-    debate = Debate(mean_conf_to_act=settings.mean_confidence_to_act)
-    broker = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
 
-    snapshot = dm.layered_snapshot_crypto(symbol) if is_crypto else dm.layered_snapshot(symbol)
-    df_30m   = snapshot["short_term"]
-    df_daily = snapshot["mid_term"]
-
-    bar_ts = _latest_bar_time(df_30m)
-    key = f"{'C' if is_crypto else 'S'}::{symbol.upper()}"
-    if not bar_ts:
-        out = {"status": "skip", "symbol": symbol, "reason": "no_data"}
-        _append_log({"kind": "crypto" if is_crypto else "stock", "bar_ts": None, **out})
-        return out
-    if last_bar_ts.get(key) == bar_ts:
-        out = {"status": "skip", "symbol": symbol, "bar_ts": bar_ts, "reason": "already_processed"}
-        _append_log({"kind": "crypto" if is_crypto else "stock", **out})
-        return out
-
-    lt = last_trade.get(key)
-    if lt and _minutes_since(lt) < COOLDOWN_MINUTES:
-        out = {"status": "cooldown", "symbol": symbol, "bar_ts": bar_ts, "wait_mins": round(COOLDOWN_MINUTES - _minutes_since(lt), 1)}
-        _append_log({"kind": "crypto" if is_crypto else "stock", **out})
-        return out
-
+    # SAFE semantic memory init — never let this crash the job
     try:
-        if fh:
-            arts = fh.crypto_news() if is_crypto else fh.company_news(symbol, days=45)
-            sm.add(arts[:30])
-    except Exception:
-        pass
+        sm = SemanticMemory()
+    except Exception as e:
+        print(f"[run_once] SemanticMemory init failed: {e} — continuing without it.")
+        sm = None
+
+    llm = LCTraderLLM(model=settings.gemini_model, api_key=settings.gemini_key)
+
+    # >>> KEY PART: lower thresholds come from config to reduce HOLD frequency
+    debate = Debate(
+        enter_th=settings.mean_confidence_to_act,
+        exit_th=settings.exit_confidence_to_act
+    )
+
+    snap = dm.layered_snapshot_crypto(sym) if is_crypto else dm.layered_snapshot(sym)
 
     short = ShortTermAgent("ShortTerm", llm, {})
     mid   = MidTermAgent("MidTerm", llm, {})
-    long  = LongTermAgent("LongTerm", llm, {}, sm)
+    long_ = LongTermAgent("LongTerm", llm, {}, sm)
 
     votes = []
-    for agent in (short, mid, long):
-        d, c, raw = agent.vote(snapshot)
-        votes.append({"agent": agent.name, "decision": d, "confidence": c})  # store slim version (no raw) in log
+    for agent in (short, mid, long_):
+        d, c, raw = agent.vote(snap)
+        votes.append({"agent": agent.name, "decision": d, "confidence": float(c), "raw": raw})
 
-    final_decision, final_conf = debate.run(votes)
-    display_symbol = df_30m["ticker"].iloc[-1] if not df_30m.empty else symbol
-    held_qty = 0.0
-    try:
-        held_qty = broker.position_qty(display_symbol)
-    except Exception:
-        pass
+    decision = debate.horizon_decide(votes)
+    reason = summarize_reason_2lines(votes, decision)
 
-    # EXIT path
-    if held_qty > 0:
-        should_exit, why_exit = exit_policy(final_decision, final_conf)
-        if should_exit:
-            oid = broker.market_sell(display_symbol, held_qty)
-            state["last_bar_ts"][key] = bar_ts
-            state["last_trade_ts"][key] = int(time.time())
-            _save_state(state)
-            out = {
-                "status": "exit",
-                "symbol": display_symbol,
-                "bar_ts": bar_ts,
-                "order_id": oid,
-                "reason": why_exit,
-                "final": {"decision": final_decision, "confidence": final_conf},
+    # 3) account & exposure
+    acct = trader.account_balances()
+    cash = acct["cash"]; equity = acct["equity"]
+    last = trader.last_price(sym) or 0.0
+    ledger = read_ledger()
+    held_qty = float(ledger.get(sym, {}).get("qty", 0.0))
+    symbol_mv = (last * held_qty) if last and held_qty else 0.0
+
+    # 4) SELL: always execute if held
+    if decision["action"] == "SELL":
+        if sym in ledger:
+            try:
+                order_id = trader.close_position(sym)
+                ledger.pop(sym, None)
+                write_ledger(ledger)
+                line = {
+                    "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                    "decision": decision, "action": "SELL",
+                    "reason": reason, "order_id": order_id,
+                    "account": trader.account_balances(),
+                }
+                _append_run(line)
+                return line
+            except Exception as e:
+                line = {
+                    "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                    "decision": decision, "action": "SELL_FAILED", "error": str(e)
+                }
+                _append_run(line)
+                return line
+        else:
+            line = {
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SELL_NO_POSITION", "reason": reason
             }
-            _append_log({
-                "kind": "crypto" if is_crypto else "stock",
-                **out,
-                "votes": votes
-            })
-            return out
+            _append_run(line)
+            return line
 
-    # ENTRY path
-    can_enter, why = entry_policy(final_decision, final_conf, df_30m, df_daily, votes)
-    if not can_enter:
-        state["last_bar_ts"][key] = bar_ts
-        _save_state(state)
-        out = {
-            "status": "hold",
-            "symbol": display_symbol,
-            "bar_ts": bar_ts,
-            "reason": why,
-            "final": {"decision": final_decision, "confidence": final_conf},
+    # 5) BUY with caps/throttles
+    if decision["action"] == "BUY" and decision.get("target_horizon") in ("short","mid","long") and last > 0:
+        horizon = decision["target_horizon"]
+
+        # throttles
+        runs = list(reversed(_read_recent_runs(400)))  # newest first after reverse below
+        runs_for_symbol = [r for r in runs if r.get("symbol") == sym]
+
+        if hit_daily_buy_limit(sym, runs_for_symbol):
+            line = {
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + " (blocked: daily buy limit)"
+            }
+            _append_run(line); return line
+
+        if too_soon_since_last_buy(sym, runs_for_symbol):
+            line = {
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + f" (blocked: cooldown {settings.REBUY_COOLDOWN_MINUTES}m)"
+            }
+            _append_run(line); return line
+
+        # $ caps
+        notional_allowed = compute_allowed_notional(horizon, cash, equity, symbol_mv)
+        if notional_allowed <= 0:
+            line = {
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + " (blocked: cash/exposure caps)"
+            }
+            _append_run(line); return line
+
+        desired_qty = notional_allowed / last
+        desired_qty = clamp_qty_by_share_caps(desired_qty, held_qty)
+        if desired_qty <= 0:
+            line = {
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + " (blocked: share cap reached)"
+            }
+            _append_run(line); return line
+
+        # execute buy (shares)
+        order_id, filled_qty, avg_px = trader.market_buy_qty(sym, desired_qty)
+
+        # first entry vs add to existing
+        if sym not in ledger:
+            tb_until = set_timebox_on_entry(sym, horizon, filled_qty, avg_px, filled_qty * avg_px)
+        else:
+            merge_entry(ledger, sym, horizon, filled_qty, avg_px, filled_qty * avg_px, reset_timebox=False)
+            write_ledger(ledger)
+            tb_until = ledger.get(sym, {}).get("timebox_until")
+
+        line = {
+            "when": _now_iso(), "symbol": sym, "trigger": trigger,
+            "decision": decision, "action": "BUY",
+            "qty": filled_qty, "entry_price": avg_px,
+            "order_id": order_id, "timebox_until": tb_until,
+            "reason": reason, "account": trader.account_balances(),
         }
-        _append_log({"kind": "crypto" if is_crypto else "stock", **out, "votes": votes})
-        return out
+        _append_run(line); return line
 
-    # We can enter
-    if final_decision == "BUY":
-        if held_qty > 0:
-            out = {"status": "hold", "symbol": display_symbol, "bar_ts": bar_ts, "reason": "already_long",
-                   "final": {"decision": final_decision, "confidence": final_conf}}
-        else:
-            qty = _qty_for_crypto(broker, display_symbol) if is_crypto else _qty_for_stock(broker, display_symbol)
-            if qty and qty > 0:
-                oid = broker.market_buy(display_symbol, qty)
-                out = {"status": "entered_long", "symbol": display_symbol, "bar_ts": bar_ts, "order_id": oid, "qty": qty,
-                       "final": {"decision": final_decision, "confidence": final_conf}}
-            else:
-                out = {"status": "hold", "symbol": display_symbol, "bar_ts": bar_ts, "reason": "qty_zero",
-                       "final": {"decision": final_decision, "confidence": final_conf}}
-    else:  # SELL signal
-        if held_qty > 0:
-            oid = broker.market_sell(display_symbol, held_qty)
-            out = {"status": "closed_long", "symbol": display_symbol, "bar_ts": bar_ts, "order_id": oid, "qty": held_qty,
-                   "final": {"decision": final_decision, "confidence": final_conf}}
-        else:
-            if not is_crypto and ALLOW_SHORTS_STOCKS:
-                qty = _qty_for_stock(broker, display_symbol)
-                if qty and qty > 0:
-                    oid = broker.market_sell(display_symbol, qty)  # paper short
-                    out = {"status": "opened_short", "symbol": display_symbol, "bar_ts": bar_ts, "order_id": oid, "qty": qty,
-                           "final": {"decision": final_decision, "confidence": final_conf}}
-                else:
-                    out = {"status": "hold", "symbol": display_symbol, "bar_ts": bar_ts, "reason": "qty_zero",
-                           "final": {"decision": final_decision, "confidence": final_conf}}
-            else:
-                out = {"status": "hold", "symbol": display_symbol, "bar_ts": bar_ts, "reason": "no_position_no_shorts",
-                       "final": {"decision": final_decision, "confidence": final_conf}}
-
-    state["last_bar_ts"][key] = bar_ts
-    state["last_trade_ts"][key] = int(time.time())
-    _save_state(state)
-
-    _append_log({"kind": "crypto" if is_crypto else "stock", **out, "votes": votes})
-    return out
-
-if __name__ == "__main__":
-    for s in WATCHLIST_STOCKS:
-        print(run_once(s, is_crypto=False))
-        time.sleep(1)
-    for c in WATCHLIST_CRYPTO:
-        print(run_once(c, is_crypto=True))
-        time.sleep(1)
+    # 6) HOLD
+    line = {
+        "when": _now_iso(), "symbol": sym, "trigger": trigger,
+        "decision": decision, "action": "HOLD", "reason": reason
+    }
+    _append_run(line)
+    return line
