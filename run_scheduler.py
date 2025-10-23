@@ -1,12 +1,12 @@
 # run_scheduler.py
 from __future__ import annotations
 import os, threading, time
-from datetime import datetime, timedelta
-from typing import Dict, Set
+from typing import Dict, List
 from apscheduler.schedulers.blocking import BlockingScheduler
 from pytz import timezone
 from autonomous_runner import run_once
-from core.trader import AlpacaTrader
+from core.trader import AlpacaTrader, _to_broker_symbol
+from core.positions import read_ledger, write_ledger
 from config import settings
 from core.finnhub_client import FinnhubClient
 from dotenv import load_dotenv
@@ -17,6 +17,33 @@ sched = BlockingScheduler(timezone=ny)
 
 WATCHLIST_STOCKS = [s.strip() for s in os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA").split(",") if s.strip()]
 WATCHLIST_CRYPTO = [s.strip() for s in os.getenv("WATCHLIST_CRYPTO", "BTC/USD,ETH/USD").split(",") if s.strip()]
+
+# ---------- helpers ----------
+def _to_display_symbol(sym: str, asset_class: str) -> str:
+    s = (sym or "").upper().replace(" ", "")
+    if "crypto" in (asset_class or "").lower():
+        for q in ("USDT", "USDC", "USD", "EUR", "BTC", "ETH"):
+            if s.endswith(q) and len(s) > len(q):
+                base = s[: -len(q)]
+                return f"{base}/{q}"
+    return s
+
+def _owned_positions(trader: AlpacaTrader) -> List[Dict]:
+    return trader.list_positions()
+
+def reconcile_ledger_with_broker(trader: AlpacaTrader):
+    """
+    Drop ledger entries that no longer exist at broker (prevents stale SELL_NO_POSITION).
+    """
+    broker = {p["symbol"]: float(p["qty"]) for p in trader.list_positions()}  # broker symbols (e.g., BTCUSD)
+    ledger = read_ledger()  # keys like 'BTC/USD'
+    changed = False
+    for sym in list(ledger.keys()):
+        if broker.get(_to_broker_symbol(sym), 0.0) <= 0.0:
+            ledger.pop(sym, None)
+            changed = True
+    if changed:
+        write_ledger(ledger)
 
 # ------------- 30m bar-close loops -------------
 @sched.scheduled_job("cron", day_of_week="mon-fri", hour="10-16", minute="2,32")
@@ -33,27 +60,29 @@ def crypto_halfhour():
 ENABLE_PRICE_POLLER = os.getenv("ENABLE_PRICE_POLLER", "1") == "1"
 ENABLE_NEWS_POLLER  = os.getenv("ENABLE_NEWS_POLLER", "1") == "1"
 
-def _owned_symbols(trader: AlpacaTrader) -> Set[str]:
-    return {p["symbol"] for p in trader.list_positions()}
-
 def price_poller():
     trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
     last_price: Dict[str, float] = {}
     last_run: Dict[str, float] = {}
     while True:
         try:
-            owned = _owned_symbols(trader)
-            for sym in owned:
-                p = trader.last_price(sym) or 0.0
+            for pos in _owned_positions(trader):
+                sym_broker = pos.get("symbol", "")
+                ac = (pos.get("asset_class") or "").lower()
+                display = _to_display_symbol(sym_broker, ac)
+                is_crypto = "crypto" in ac
+
+                p = trader.last_price(display) or 0.0
                 if p <= 0:
                     continue
-                prev = last_price.get(sym, p)
-                last_price[sym] = p
-                # simple trigger: >1% move since last snapshot and at least 2 minutes since last decision
+                prev = last_price.get(display, p)
+                last_price[display] = p
+
+                # simple trigger: >1% move and ≥2 min since last run
                 if prev > 0 and abs(p - prev) / prev >= 0.01:
-                    if (time.time() - last_run.get(sym, 0)) > 120:
-                        print(run_once(sym, is_crypto=False, trigger="price_event"))
-                        last_run[sym] = time.time()
+                    if (time.time() - last_run.get(display, 0)) > 120:
+                        print(run_once(display, is_crypto=is_crypto, trigger="price_event"))
+                        last_run[display] = time.time()
         except Exception:
             pass
         time.sleep(20)
@@ -64,11 +93,15 @@ def news_poller():
     last_seen_ts: Dict[str, int] = {}
     while True:
         try:
-            for sym in _owned_symbols(trader):
-                items = fh.company_news_struct(sym, days=3, max_items=5)
-                if not items:
+            for pos in _owned_positions(trader):
+                ac = (pos.get("asset_class") or "").lower()
+                if "crypto" in ac:
+                    continue  # skip crypto for company news
+                sym = pos.get("symbol", "")
+                latest_items = fh.company_news_struct(sym, days=3, max_items=5)
+                if not latest_items:
                     continue
-                latest = int(items[0].get("datetime") or 0)
+                latest = int(latest_items[0].get("datetime") or 0)
                 if latest > last_seen_ts.get(sym, 0):
                     print(run_once(sym, is_crypto=False, trigger="news_event", news_boost=True))
                     last_seen_ts[sym] = latest
@@ -77,6 +110,14 @@ def news_poller():
         time.sleep(120)
 
 if __name__ == "__main__":
+    # Initialize DB tables (creates if missing)
+    from core.db import init_db
+    init_db()
+
+    # Reconcile local ledger once on startup
+    trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
+    reconcile_ledger_with_broker(trader)
+
     if ENABLE_PRICE_POLLER:
         threading.Thread(target=price_poller, daemon=True).start()
     if ENABLE_NEWS_POLLER:

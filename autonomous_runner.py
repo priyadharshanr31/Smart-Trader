@@ -15,6 +15,7 @@ from core.policy import (
 from core.trader import AlpacaTrader
 from core.positions import read_ledger, write_ledger, set_timebox_on_entry, merge_entry
 from core.semantic_memory import SemanticMemory
+from core.store import save_run_dict   # dual-write to MySQL
 from agents.short_term_agent import ShortTermAgent
 from agents.mid_term_agent import MidTermAgent
 from agents.long_term_agent import LongTermAgent
@@ -29,6 +30,10 @@ def _now_iso() -> str:
 def _append_run(line: Dict[str, Any]) -> None:
     with open(RUN_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(line) + "\n")
+    try:
+        save_run_dict(line)
+    except Exception as e:
+        print(f"[runs->mysql] save failed: {e}")
 
 def _read_recent_runs(max_lines=500) -> List[dict]:
     if not os.path.exists(RUN_LOG):
@@ -83,11 +88,6 @@ def run_once(symbol: str,
              news_boost: bool = False) -> Dict[str, Any]:
     """
     One full decision cycle for a symbol.
-    - Enforce timeboxes (forced exits)
-    - Build layered data
-    - Get agent votes
-    - Debate → final decision with horizon
-    - Policy: execute SELL immediately, BUY with caps/throttles or log SUGGEST_BUY
     """
     sym = symbol.upper()
 
@@ -109,7 +109,6 @@ def run_once(symbol: str,
 
     llm = LCTraderLLM(model=settings.gemini_model, api_key=settings.gemini_key)
 
-    # >>> KEY PART: lower thresholds come from config to reduce HOLD frequency
     debate = Debate(
         enter_th=settings.mean_confidence_to_act,
         exit_th=settings.exit_confidence_to_act
@@ -132,22 +131,36 @@ def run_once(symbol: str,
     # 3) account & exposure
     acct = trader.account_balances()
     cash = acct["cash"]; equity = acct["equity"]
-    last = trader.last_price(sym) or 0.0
-    ledger = read_ledger()
-    held_qty = float(ledger.get(sym, {}).get("qty", 0.0))
-    symbol_mv = (last * held_qty) if last and held_qty else 0.0
 
-    # 4) SELL: always execute if held
+    # Primary price source = Alpaca; fallback to the snapshot's latest close
+    alpaca_px = trader.last_price(sym)
+    snap_px = None
+    try:
+        st = snap.get("short_term")
+        if st is not None and not st.empty and "close" in st.columns:
+            snap_px = float(st["close"].iloc[-1])
+    except Exception:
+        snap_px = None
+    last = float(alpaca_px or 0.0) or float(snap_px or 0.0)  # fallback if Alpaca returns None/0
+
+    ledger = read_ledger()
+    held_qty_ledger = float((ledger.get(sym, {}) or {}).get("qty", 0.0))
+    symbol_mv = (last * held_qty_ledger) if last and held_qty_ledger else 0.0
+
+    # 4) SELL: execute if either ledger or broker shows qty > 0
     if decision["action"] == "SELL":
-        if sym in ledger:
+        held_qty_broker = trader.position_qty(sym)
+        if (held_qty_ledger > 0.0) or (held_qty_broker > 0.0):
             try:
                 order_id = trader.close_position(sym)
-                ledger.pop(sym, None)
-                write_ledger(ledger)
+                if sym in ledger:
+                    ledger.pop(sym, None)
+                    write_ledger(ledger)
                 line = {
                     "when": _now_iso(), "symbol": sym, "trigger": trigger,
                     "decision": decision, "action": "SELL",
-                    "reason": reason, "order_id": order_id,
+                    "reason": reason + f" (pre-sell qty: ledger={held_qty_ledger:.8f}, broker={held_qty_broker:.8f})",
+                    "order_id": order_id,
                     "account": trader.account_balances(),
                 }
                 _append_run(line)
@@ -162,56 +175,71 @@ def run_once(symbol: str,
         else:
             line = {
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SELL_NO_POSITION", "reason": reason
+                "decision": decision, "action": "SELL_NO_POSITION",
+                "reason": f"{reason} (no open position: ledger={held_qty_ledger:.8f}, broker={held_qty_broker:.8f})"
             }
             _append_run(line)
             return line
 
     # 5) BUY with caps/throttles
-    if decision["action"] == "BUY" and decision.get("target_horizon") in ("short","mid","long") and last > 0:
-        horizon = decision["target_horizon"]
+    if decision["action"] == "BUY":
+        horizon = decision.get("target_horizon")
+
+        # Guard 1: require a valid horizon
+        if horizon not in ("short", "mid", "long"):
+            _append_run({
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + " (blocked: missing/invalid target_horizon)"
+            })
+            return {"action": "SUGGEST_BUY"}
+
+        # Guard 2: need a working price
+        if last <= 0:
+            _append_run({
+                "when": _now_iso(), "symbol": sym, "trigger": trigger,
+                "decision": decision, "action": "SUGGEST_BUY",
+                "reason": reason + f" (blocked: no price; alpaca_px={alpaca_px}, snap_px={snap_px})"
+            })
+            return {"action": "SUGGEST_BUY"}
 
         # throttles
-        runs = list(reversed(_read_recent_runs(400)))  # newest first after reverse below
+        runs = list(reversed(_read_recent_runs(400)))
         runs_for_symbol = [r for r in runs if r.get("symbol") == sym]
 
         if hit_daily_buy_limit(sym, runs_for_symbol):
-            line = {
+            _append_run({
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: daily buy limit)"
-            }
-            _append_run(line); return line
+            }); return {"action": "SUGGEST_BUY"}
 
         if too_soon_since_last_buy(sym, runs_for_symbol):
-            line = {
+            _append_run({
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + f" (blocked: cooldown {settings.REBUY_COOLDOWN_MINUTES}m)"
-            }
-            _append_run(line); return line
+            }); return {"action": "SUGGEST_BUY"}
 
         # $ caps
         notional_allowed = compute_allowed_notional(horizon, cash, equity, symbol_mv)
         if notional_allowed <= 0:
-            line = {
+            _append_run({
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: cash/exposure caps)"
-            }
-            _append_run(line); return line
+            }); return {"action": "SUGGEST_BUY"}
 
         desired_qty = notional_allowed / last
-        desired_qty = clamp_qty_by_share_caps(desired_qty, held_qty)
+        desired_qty = clamp_qty_by_share_caps(desired_qty, held_qty_ledger)
         if desired_qty <= 0:
-            line = {
+            _append_run({
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: share cap reached)"
-            }
-            _append_run(line); return line
+            }); return {"action": "SUGGEST_BUY"}
 
-        # execute buy (shares)
+        # execute buy (shares) — returns (order_id, filled_qty, avg_px)
         order_id, filled_qty, avg_px = trader.market_buy_qty(sym, desired_qty)
 
         # first entry vs add to existing

@@ -18,3 +18,4 @@ Thumbs.db
 .env
 state/
 *.log
+text2image.json
