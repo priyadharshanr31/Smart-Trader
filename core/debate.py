@@ -15,8 +15,28 @@ class Debate:
                  enter_th: float = 0.60,
                  exit_th: float = 0.45,
                  weights: Dict[str, float] | None = None):
+        """
+        Initialize the Debate object with configurable thresholds and weights.
+
+        Parameters
+        ----------
+        enter_th : float, optional
+            Confidence threshold to trigger a BUY action. A lower value makes the
+            system more willing to take a position. Default is 0.60.
+        exit_th : float, optional
+            Confidence threshold to trigger a SELL action. A lower value makes the
+            system more willing to exit a position. Default is 0.45.
+        weights : dict, optional
+            Per‑horizon weights used to combine agent votes. If not provided, a
+            default weighting favouring short‑term signals is used.
+
+        The default thresholds and weights have been tuned conservatively; the
+        caller can pass lower thresholds via settings to make the agent more
+        decisive while still respecting risk controls.
+        """
         self.enter_th = float(enter_th)
         self.exit_th = float(exit_th)
+        # emphasise short‑term signals slightly but allow overrides
         self.weights = weights or {"short": 0.40, "mid": 0.35, "long": 0.25}
 
     # ------------ legacy output (UI uses this) ------------
@@ -56,14 +76,54 @@ class Debate:
             side_factor = 1.0 if side == "BUY" else (-1.0 if side == "SELL" else 0.0)
             scores[h] += self.weights.get(h, 0.0) * conf * side_factor
 
+        # Aggregate the weighted signals into a net score. A positive net score
+        # indicates broad BUY pressure across horizons; a negative score indicates
+        # broad SELL pressure. This allows the system to act when multiple
+        # horizons align, even if no individual horizon crosses its threshold.
+        net_score = sum(scores.values())
+
+        # Identify the strongest individual positive and negative scores
         best_h, best_score = max(scores.items(), key=lambda kv: kv[1])
         worst_h, worst_score = min(scores.items(), key=lambda kv: kv[1])
 
+        # If the aggregate conviction is high enough, act on the overall net.
+        if net_score >= self.enter_th:
+            return {
+                "action": "BUY",
+                "target_horizon": best_h,
+                "confidence": round(net_score, 3),
+                "scores": scores,
+            }
+        if net_score <= -self.exit_th:
+            return {
+                "action": "SELL",
+                "target_horizon": worst_h,
+                "confidence": round(abs(net_score), 3),
+                "scores": scores,
+            }
+
+        # Fall back to the previous behaviour: if a single horizon is very
+        # confident, act on that. Otherwise return HOLD.
         if best_score >= self.enter_th:
-            return {"action": "BUY", "target_horizon": best_h, "confidence": round(best_score, 3), "scores": scores}
+            return {
+                "action": "BUY",
+                "target_horizon": best_h,
+                "confidence": round(best_score, 3),
+                "scores": scores,
+            }
         if abs(worst_score) >= self.exit_th:
-            return {"action": "SELL", "target_horizon": worst_h, "confidence": round(abs(worst_score), 3), "scores": scores}
-        return {"action": "HOLD", "target_horizon": None, "confidence": round(max(abs(best_score), abs(worst_score)), 3), "scores": scores}
+            return {
+                "action": "SELL",
+                "target_horizon": worst_h,
+                "confidence": round(abs(worst_score), 3),
+                "scores": scores,
+            }
+        return {
+            "action": "HOLD",
+            "target_horizon": None,
+            "confidence": round(max(abs(best_score), abs(worst_score)), 3),
+            "scores": scores,
+        }
 
 
 # ---- concise human reason for UI/logs ----

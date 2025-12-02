@@ -24,8 +24,10 @@ STATE_DIR = "state"
 RUN_LOG = os.path.join(STATE_DIR, "auto_runs.jsonl")
 os.makedirs(STATE_DIR, exist_ok=True)
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+
 
 def _append_run(line: Dict[str, Any]) -> None:
     with open(RUN_LOG, "a", encoding="utf-8") as f:
@@ -35,6 +37,7 @@ def _append_run(line: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[runs->mysql] save failed: {e}")
 
+
 def _read_recent_runs(max_lines=500) -> List[dict]:
     if not os.path.exists(RUN_LOG):
         return []
@@ -42,12 +45,14 @@ def _read_recent_runs(max_lines=500) -> List[dict]:
     with open(RUN_LOG, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             try:
                 out.append(json.loads(line))
             except Exception:
                 pass
     return out[-max_lines:]
+
 
 # ---- timebox enforcement on every cycle ----
 def enforce_timeboxes(trader: AlpacaTrader):
@@ -82,14 +87,19 @@ def enforce_timeboxes(trader: AlpacaTrader):
     if changed:
         write_ledger(ledger)
 
-def run_once(symbol: str,
-             is_crypto: bool = False,
-             trigger: str = "bar_close_30m",
-             news_boost: bool = False) -> Dict[str, Any]:
+
+def run_once(
+    symbol: str,
+    is_crypto: bool = False,
+    trigger: str = "bar_close_30m",
+    news_boost: bool = False
+) -> Dict[str, Any]:
     """
     One full decision cycle for a symbol.
     """
     sym = symbol.upper()
+
+    print(f"\n[run_once] ===== RUN START for {sym} (is_crypto={is_crypto}, trigger={trigger}) =====")
 
     # toolbelt
     trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
@@ -107,7 +117,14 @@ def run_once(symbol: str,
         print(f"[run_once] SemanticMemory init failed: {e} — continuing without it.")
         sm = None
 
+    # LLM with current Gemini key
     llm = LCTraderLLM(model=settings.gemini_model, api_key=settings.gemini_key)
+
+    # DEBUG: which Gemini key is this run using?
+    try:
+        print(f"[run_once] Gemini key fingerprint: {llm.debug_key_fingerprint()}")
+    except Exception as e:
+        print(f"[run_once] Could not get Gemini key fingerprint: {e}")
 
     debate = Debate(
         enter_th=settings.mean_confidence_to_act,
@@ -120,13 +137,36 @@ def run_once(symbol: str,
     mid   = MidTermAgent("MidTerm", llm, {})
     long_ = LongTermAgent("LongTerm", llm, {}, sm)
 
-    votes = []
+    # --- Agent votes + debug logging ---
+    votes: List[Dict[str, Any]] = []
     for agent in (short, mid, long_):
         d, c, raw = agent.vote(snap)
-        votes.append({"agent": agent.name, "decision": d, "confidence": float(c), "raw": raw})
+        v = {"agent": agent.name, "decision": d, "confidence": float(c), "raw": raw}
+        votes.append(v)
+
+    print(f"[run_once] Votes for {sym} (trigger={trigger}):")
+    for v in votes:
+        raw_preview = str(v["raw"])
+        if len(raw_preview) > 300:
+            raw_preview = raw_preview[:300] + "..."
+        print(
+            f"  - {v['agent']}: {v['decision']} (conf={v['confidence']:.2f})\n"
+            f"    rationale: {raw_preview}"
+        )
 
     decision = debate.horizon_decide(votes)
     reason = summarize_reason_2lines(votes, decision)
+
+    # DEBUG: final ensemble decision
+    try:
+        print(
+            f"[run_once] Final decision for {sym}: "
+            f"{decision.get('action')} "
+            f"(horizon={decision.get('target_horizon')}, "
+            f"conf={float(decision.get('confidence', 0.0)):.2f})"
+        )
+    except Exception:
+        print(f"[run_once] Final decision for {sym}: {decision}")
 
     # 3) account & exposure
     acct = trader.account_balances()
@@ -212,14 +252,16 @@ def run_once(symbol: str,
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: daily buy limit)"
-            }); return {"action": "SUGGEST_BUY"}
+            })
+            return {"action": "SUGGEST_BUY"}
 
         if too_soon_since_last_buy(sym, runs_for_symbol):
             _append_run({
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + f" (blocked: cooldown {settings.REBUY_COOLDOWN_MINUTES}m)"
-            }); return {"action": "SUGGEST_BUY"}
+            })
+            return {"action": "SUGGEST_BUY"}
 
         # $ caps
         notional_allowed = compute_allowed_notional(horizon, cash, equity, symbol_mv)
@@ -228,7 +270,8 @@ def run_once(symbol: str,
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: cash/exposure caps)"
-            }); return {"action": "SUGGEST_BUY"}
+            })
+            return {"action": "SUGGEST_BUY"}
 
         desired_qty = notional_allowed / last
         desired_qty = clamp_qty_by_share_caps(desired_qty, held_qty_ledger)
@@ -237,7 +280,8 @@ def run_once(symbol: str,
                 "when": _now_iso(), "symbol": sym, "trigger": trigger,
                 "decision": decision, "action": "SUGGEST_BUY",
                 "reason": reason + " (blocked: share cap reached)"
-            }); return {"action": "SUGGEST_BUY"}
+            })
+            return {"action": "SUGGEST_BUY"}
 
         # execute buy (shares) — returns (order_id, filled_qty, avg_px)
         order_id, filled_qty, avg_px = trader.market_buy_qty(sym, desired_qty)
@@ -257,7 +301,8 @@ def run_once(symbol: str,
             "order_id": order_id, "timebox_until": tb_until,
             "reason": reason, "account": trader.account_balances(),
         }
-        _append_run(line); return line
+        _append_run(line)
+        return line
 
     # 6) HOLD
     line = {

@@ -34,15 +34,37 @@ st.set_page_config(page_title="Three-Agent Trader", page_icon="🤖", layout="wi
 
 # ------------------------- Sidebar: keys & settings -------------------------
 st.sidebar.header("🔐 API Keys")
+
+# API Key Inputs
 alpaca_key    = st.sidebar.text_input("Alpaca API Key ID", value=settings.alpaca_key or "", type="password")
 alpaca_secret = st.sidebar.text_input("Alpaca Secret Key", value=settings.alpaca_secret or "", type="password")
 alpaca_base   = st.sidebar.text_input("Alpaca Paper Base URL", value=settings.alpaca_base_url)
-
 finnhub_key   = st.sidebar.text_input("Finnhub API Key", value=settings.finnhub_key or "", type="password")
 gemini_key    = st.sidebar.text_input("Gemini API Key", value=settings.gemini_key or "", type="password")
 
+# Strategy Settings
 st.sidebar.header("⚙️ Strategy Settings")
 mean_conf = st.sidebar.slider("Min confidence to act", 0.0, 1.0, settings.mean_confidence_to_act, 0.05)
+
+# ⬇️ Immediately update environment variables and config settings
+import os
+from config import settings
+
+# Update .env values in memory for the current session
+os.environ["ALPACA_API_KEY_ID"]     = alpaca_key or os.getenv("ALPACA_API_KEY_ID", "")
+os.environ["ALPACA_API_SECRET_KEY"] = alpaca_secret or os.getenv("ALPACA_API_SECRET_KEY", "")
+os.environ["ALPACA_BASE_URL"]       = alpaca_base or os.getenv("ALPACA_BASE_URL", "")
+os.environ["FINNHUB_API_KEY"]       = finnhub_key or os.getenv("FINNHUB_API_KEY", "")
+os.environ["GEMINI_API_KEY"]        = gemini_key or os.getenv("GEMINI_API_KEY", "")
+
+# Update runtime settings object
+settings.alpaca_key = alpaca_key
+settings.alpaca_secret = alpaca_secret
+settings.alpaca_base_url = alpaca_base
+settings.finnhub_key = finnhub_key
+settings.gemini_key = gemini_key
+settings.mean_confidence_to_act = mean_conf
+
 
 st.sidebar.header("📈 Watchlist")
 default_watch = os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA,AMZN,GOOG,META,TSLA")

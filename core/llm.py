@@ -4,14 +4,29 @@ import os, json, re
 from typing import Tuple, Dict, Any, List, Optional
 
 import google.generativeai as genai
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Load .env from the project root (or nearest) and allow it to override any existing env vars.
+# Using find_dotenv ensures we pick up the .env file even when the working directory
+# differs from the location of this module. Without this, the GEMINI_API_KEY and other
+# secrets defined in the repository's `.env` may not be loaded, causing the LLM to
+# misconfigure and always return HOLD. Override existing env variables to honour
+# settings in the `.env` file.
+dotenv_path = find_dotenv()  # search for .env in current and parent directories
+if dotenv_path:
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+else:
+    # fall back to default behaviour
+    load_dotenv(override=True)
 
 
 def _configure_genai(explicit_key: Optional[str]) -> str:
     """
     Configure Gemini once (explicit key > env).
+
+    Priority:
+      1. explicit_key passed in
+      2. GEMINI_API_KEY from environment (.env after load_dotenv)
     """
     key = (explicit_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not key:
@@ -33,7 +48,11 @@ def _parse_vote(text: str) -> Tuple[str, float]:
     """
     Prefer strict JSON like:
       {"vote":"BUY|SELL|HOLD","confidence":0.73,"rationale":"..."}
-    Fallback to: "VOTE: BUY ... CONFIDENCE: 0.73"
+
+    Fallbacks:
+      - JSON with slightly different keys (decision/VOTE, CONFIDENCE)
+      - "VOTE: BUY ... CONFIDENCE: 0.73"
+      - bare 'BUY'/'SELL'/'HOLD' with neutral confidence 0.5
     """
     text = (text or "").strip()
 
@@ -42,7 +61,12 @@ def _parse_vote(text: str) -> Tuple[str, float]:
     if m_json:
         try:
             obj = json.loads(m_json.group(0))
-            vote = str(obj.get("vote") or obj.get("decision") or obj.get("VOTE") or "").upper()
+            vote = str(
+                obj.get("vote")
+                or obj.get("decision")
+                or obj.get("VOTE")
+                or ""
+            ).upper()
             conf = float(obj.get("confidence") or obj.get("CONFIDENCE") or 0.0)
             if vote in {"BUY", "SELL", "HOLD"} and 0.0 <= conf <= 1.0:
                 return vote, conf
@@ -52,7 +76,8 @@ def _parse_vote(text: str) -> Tuple[str, float]:
     # 2) Fallback: "VOTE: X ... CONFIDENCE: y"
     m = re.search(
         r"VOTE\s*:\s*(BUY|SELL|HOLD)\b.*?CONFIDENCE\s*:\s*([01](?:\.\d+)?)",
-        text, re.IGNORECASE | re.DOTALL
+        text,
+        re.IGNORECASE | re.DOTALL,
     )
     if m:
         return m.group(1).upper(), float(m.group(2))
@@ -91,7 +116,10 @@ class LCTraderLLM:
     """
 
     def __init__(self, model: str | None = None, api_key: Optional[str] = None, **_: Any):
-        _configure_genai(api_key)
+        # Configure Gemini client and remember which key was used for this instance.
+        # This is useful for debugging when multiple keys/environments are in play.
+        self.api_key_used: str = _configure_genai(api_key)
+
         # call order with fallbacks
         self.model_chain: List[str] = []
         if model:
@@ -99,6 +127,18 @@ class LCTraderLLM:
         for m in FALLBACK_MODELS:
             if m not in self.model_chain:
                 self.model_chain.append(m)
+
+    def debug_key_fingerprint(self) -> str:
+        """
+        Helper for logging: return a short fingerprint of the API key so you
+        can see which key is being used without dumping the whole secret.
+
+        Example output: 'AIza...9QkL'.
+        """
+        k = self.api_key_used or ""
+        if len(k) <= 8:
+            return k
+        return f"{k[:4]}...{k[-4:]}"
 
     def vote_structured(
         self,

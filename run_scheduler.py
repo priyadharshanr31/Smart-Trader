@@ -9,14 +9,21 @@ from core.trader import AlpacaTrader, _to_broker_symbol
 from core.positions import read_ledger, write_ledger
 from config import settings
 from core.finnhub_client import FinnhubClient
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+# Load .env from project root to pick up API keys (e.g., GEMINI_API_KEY).  Using
+# find_dotenv ensures we locate the .env file even if run_scheduler is invoked
+# from outside its containing directory.
+dotenv_path = find_dotenv()
+if dotenv_path:
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+else:
+    load_dotenv(override=True)
 
 ny = timezone("America/New_York")
 sched = BlockingScheduler(timezone=ny)
 
-WATCHLIST_STOCKS = [s.strip() for s in os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA").split(",") if s.strip()]
-WATCHLIST_CRYPTO = [s.strip() for s in os.getenv("WATCHLIST_CRYPTO", "BTC/USD,ETH/USD").split(",") if s.strip()]
+WATCHLIST_STOCKS = [s.strip() for s in os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA,ORCL,AMD,PLTR,INTC").split(",") if s.strip()]
+WATCHLIST_CRYPTO = [s.strip() for s in os.getenv("WATCHLIST_CRYPTO", "BTC/USD,ETH/USD,SOL/USD").split(",") if s.strip()]
 
 # ---------- helpers ----------
 def _to_display_symbol(sym: str, asset_class: str) -> str:
