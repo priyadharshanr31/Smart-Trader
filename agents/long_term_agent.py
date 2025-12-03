@@ -21,7 +21,12 @@ USER_TMPL = (
 REQ_COLS = ["close", "rsi", "macd", "macd_signal", "upper_band", "lower_band"]
 
 class LongTermAgent(BaseAgent):
-    MIN_ROWS = 200
+    # Minimum number of rows for the long‑term agent.  Crypto pairs and
+    # newly added tickers often have fewer than 200 weekly bars.  Relaxing
+    # this threshold to 100 ensures the long‑term agent participates in
+    # decision making for such assets rather than immediately returning
+    # HOLD due to insufficient history.
+    MIN_ROWS = 100
     TAIL_N = 10
 
     def __init__(self, name, llm, config, semantic_memory):
@@ -71,5 +76,48 @@ class LongTermAgent(BaseAgent):
         except Exception:
             conf = 0.5
         conf = max(0.0, min(1.0, conf))
+
+        # ---------------------------------------------------------------
+        # Fallback heuristic for long‑term: If the LLM returns HOLD with
+        # confidence ≤0.5, fall back on a simple weekly trend analysis.
+        # Use 10‑week and 30‑week moving averages to gauge macro regime
+        # and determine BUY/SELL signals.  If the short MA is above the
+        # long MA with positive slope, we BUY; if below with negative
+        # slope, we SELL; otherwise HOLD.  Confidence scales with the
+        # relative separation of the MAs.  This ensures that even when
+        # the generative model is offline, the agent can still make
+        # informed macro decisions.
+        if decision.upper() == "HOLD" and conf <= 0.5:
+            try:
+                close = df['close']
+                ma10_series = close.rolling(window=10).mean()
+                ma30_series = close.rolling(window=30).mean()
+                ma10_last = float(ma10_series.iloc[-1])
+                ma30_last = float(ma30_series.iloc[-1])
+                # compute slopes over last 10 periods (approx two months)
+                ma10_prev = float(ma10_series.iloc[-10]) if len(ma10_series) >= 10 else ma10_last
+                ma30_prev = float(ma30_series.iloc[-10]) if len(ma30_series) >= 10 else ma30_last
+                slope10 = ma10_last - ma10_prev
+                slope30 = ma30_last - ma30_prev
+                buy_signal = False
+                sell_signal = False
+                if (ma10_last > ma30_last) and (slope10 > 0 or slope30 > 0):
+                    buy_signal = True
+                if (ma10_last < ma30_last) and (slope10 < 0 or slope30 < 0):
+                    sell_signal = True
+                if buy_signal and not sell_signal:
+                    decision = "BUY"
+                    distance = abs(ma10_last - ma30_last) / (ma30_last + 1e-9)
+                    conf = min(1.0, 0.5 + distance * 2.0)
+                elif sell_signal and not buy_signal:
+                    decision = "SELL"
+                    distance = abs(ma10_last - ma30_last) / (ma30_last + 1e-9)
+                    conf = min(1.0, 0.5 + distance * 2.0)
+                else:
+                    decision = "HOLD"
+                    conf = 0.4
+                raw = f"{raw} [fallback_heuristic_longterm]"
+            except Exception:
+                pass
 
         return decision, conf, raw

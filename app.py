@@ -34,37 +34,111 @@ st.set_page_config(page_title="Three-Agent Trader", page_icon="🤖", layout="wi
 
 # ------------------------- Sidebar: keys & settings -------------------------
 st.sidebar.header("🔐 API Keys")
+#
+# Instead of pre-populating API key inputs with potentially stale values from the
+# environment, we start with empty strings (password fields) and fall back to
+# environment variables or config values only after the user has had an
+# opportunity to supply new keys.  This prevents an expired or incorrect
+# `GEMINI_API_KEY` from being displayed or inadvertently used by default.
 
-# API Key Inputs
-alpaca_key    = st.sidebar.text_input("Alpaca API Key ID", value=settings.alpaca_key or "", type="password")
-alpaca_secret = st.sidebar.text_input("Alpaca Secret Key", value=settings.alpaca_secret or "", type="password")
-alpaca_base   = st.sidebar.text_input("Alpaca Paper Base URL", value=settings.alpaca_base_url)
-finnhub_key   = st.sidebar.text_input("Finnhub API Key", value=settings.finnhub_key or "", type="password")
-gemini_key    = st.sidebar.text_input("Gemini API Key", value=settings.gemini_key or "", type="password")
+# Alpaca keys: leave blank to use values from .env or environment
+alpaca_key_input    = st.sidebar.text_input(
+    "Alpaca API Key ID",
+    value="",
+    type="password",
+)
+alpaca_secret_input = st.sidebar.text_input(
+    "Alpaca Secret Key",
+    value="",
+    type="password",
+)
+alpaca_base   = st.sidebar.text_input(
+    "Alpaca Paper Base URL",
+    value=settings.alpaca_base_url,
+)
 
-# Strategy Settings
+# Optional API keys: leave blank to use values from .env or environment
+finnhub_key_input   = st.sidebar.text_input(
+    "Finnhub API Key",
+    value="",
+    type="password",
+)
+gemini_key_input    = st.sidebar.text_input(
+    "Gemini API Key",
+    value="",
+    type="password",
+)
+
 st.sidebar.header("⚙️ Strategy Settings")
-mean_conf = st.sidebar.slider("Min confidence to act", 0.0, 1.0, settings.mean_confidence_to_act, 0.05)
+mean_conf = st.sidebar.slider(
+    "Min confidence to act",
+    0.0,
+    1.0,
+    settings.mean_confidence_to_act,
+    0.05,
+)
 
-# ⬇️ Immediately update environment variables and config settings
-import os
-from config import settings
+# ---------------------------------------------------------------------------
+# After collecting user inputs, determine the actual keys to use.  If the user
+# leaves a field blank, we fall back to the corresponding environment
+# variable or the value defined in `config.py`.  This allows the application
+# to honour values from `.env` without showing them in the UI and avoids
+# pre-populating stale keys.  We then update the runtime environment and
+# `settings` so that subsequent calls within this session use the resolved
+# keys consistently.
 
-# Update .env values in memory for the current session
-os.environ["ALPACA_API_KEY_ID"]     = alpaca_key or os.getenv("ALPACA_API_KEY_ID", "")
-os.environ["ALPACA_API_SECRET_KEY"] = alpaca_secret or os.getenv("ALPACA_API_SECRET_KEY", "")
-os.environ["ALPACA_BASE_URL"]       = alpaca_base or os.getenv("ALPACA_BASE_URL", "")
-os.environ["FINNHUB_API_KEY"]       = finnhub_key or os.getenv("FINNHUB_API_KEY", "")
-os.environ["GEMINI_API_KEY"]        = gemini_key or os.getenv("GEMINI_API_KEY", "")
+import os as _os  # local import to avoid clobbering the top-level os
 
-# Update runtime settings object
+# Resolve Alpaca keys
+alpaca_key = (
+    alpaca_key_input
+    or _os.getenv("ALPACA_API_KEY_ID")
+    or settings.alpaca_key
+    or ""
+)
+alpaca_secret = (
+    alpaca_secret_input
+    or _os.getenv("ALPACA_API_SECRET_KEY")
+    or settings.alpaca_secret
+    or ""
+)
+
+# Resolve optional Finnhub key
+finnhub_key = (
+    finnhub_key_input
+    or _os.getenv("FINNHUB_API_KEY")
+    or settings.finnhub_key
+    or ""
+)
+
+# Resolve Gemini key
+gemini_key = (
+    gemini_key_input
+    or _os.getenv("GEMINI_API_KEY")
+    or settings.gemini_key
+    or ""
+)
+
+# Persist the resolved keys into the environment for this session.  This
+# ensures that downstream modules (e.g., `core.llm.LCTraderLLM`) which rely
+# on `os.getenv()` see the correct values.  Use `.env` fallback only if
+# user did not override them in the sidebar.
+_os.environ["ALPACA_API_KEY_ID"] = alpaca_key
+_os.environ["ALPACA_API_SECRET_KEY"] = alpaca_secret
+_os.environ["ALPACA_PAPER_BASE_URL"] = alpaca_base
+_os.environ["FINNHUB_API_KEY"] = finnhub_key
+_os.environ["GEMINI_API_KEY"] = gemini_key
+
+# Update the global settings object to reflect the new keys.  This is
+# important because other parts of the application use `settings.*` to
+# initialise clients.  Without this update, those modules may continue
+# referencing stale values.
 settings.alpaca_key = alpaca_key
 settings.alpaca_secret = alpaca_secret
 settings.alpaca_base_url = alpaca_base
 settings.finnhub_key = finnhub_key
 settings.gemini_key = gemini_key
 settings.mean_confidence_to_act = mean_conf
-
 
 st.sidebar.header("📈 Watchlist")
 default_watch = os.getenv("WATCHLIST_STOCKS", "AAPL,MSFT,NVDA,AMZN,GOOG,META,TSLA")

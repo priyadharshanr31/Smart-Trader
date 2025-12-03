@@ -1,313 +1,288 @@
-# autonomous_runner.py
 from __future__ import annotations
-import os, json
+
+import os
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
 
 from config import settings
 from core.data_manager import DataManager
-from core.debate import Debate, summarize_reason_2lines
-from core.llm import LCTraderLLM
-from core.policy import (
-    compute_allowed_notional, clamp_qty_by_share_caps,
-    too_soon_since_last_buy, hit_daily_buy_limit
-)
-from core.trader import AlpacaTrader
-from core.positions import read_ledger, write_ledger, set_timebox_on_entry, merge_entry
 from core.semantic_memory import SemanticMemory
-from core.store import save_run_dict   # dual-write to MySQL
-from agents.short_term_agent import ShortTermAgent
-from agents.mid_term_agent import MidTermAgent
-from agents.long_term_agent import LongTermAgent
+from core.finnhub_client import FinnhubClient
+from core.llm import LCTraderLLM
+from core.debate import Debate
+from core.trader import AlpacaTrader
+from core.policy import (
+    compute_allowed_notional,
+    clamp_qty_by_share_caps,
+    too_soon_since_last_buy,
+    hit_daily_buy_limit,
+)
+from core.positions import read_ledger, write_ledger
+
+# Ensure .env is loaded for GEMINI_API_KEY, Alpaca, etc.
+dotenv_path = find_dotenv()
+if dotenv_path:
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+else:
+    load_dotenv(override=True)
+
 
 STATE_DIR = "state"
 RUN_LOG = os.path.join(STATE_DIR, "auto_runs.jsonl")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+def _extract_rationale(raw: str) -> str:
+    """
+    Best-effort extraction of 'rationale' from the LLM raw string.
 
+    raw looks like:
+      [model=models/gemini-2.5-flash] ```json
+      {
+        "vote": "BUY",
+        "confidence": 0.8,
+        "rationale": "Price is breaking out..."
+      }
+      ```
+    We just search for "rationale" and grab that field.
+    """
+    if not raw:
+        return ""
+    text = raw
+    # crude search for "rationale"
+    import re, json
 
-def _append_run(line: Dict[str, Any]) -> None:
-    with open(RUN_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(line) + "\n")
-    try:
-        save_run_dict(line)
-    except Exception as e:
-        print(f"[runs->mysql] save failed: {e}")
-
-
-def _read_recent_runs(max_lines=500) -> List[dict]:
-    if not os.path.exists(RUN_LOG):
-        return []
-    out: List[dict] = []
-    with open(RUN_LOG, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-    return out[-max_lines:]
-
-
-# ---- timebox enforcement on every cycle ----
-def enforce_timeboxes(trader: AlpacaTrader):
-    ledger = read_ledger()
-    now = datetime.now(timezone.utc)
-    changed = False
-    for sym, meta in list(ledger.items()):
-        tb = meta.get("timebox_until")
-        if not tb:
-            continue
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
         try:
-            until = datetime.fromisoformat(tb.replace("Z","+00:00")).astimezone(timezone.utc)
+            obj = json.loads(m.group(0))
+            rat = obj.get("rationale") or obj.get("reason") or ""
+            if isinstance(rat, str):
+                return rat.strip()
         except Exception:
-            continue
-        if now >= until:
-            try:
-                order_id = trader.close_position(sym)
-                _append_run({
-                    "when": _now_iso(), "symbol": sym, "trigger": "timebox_expired",
-                    "action": "FORCED_EXIT",
-                    "reason": f"Timebox expired for {meta.get('horizon')}",
-                    "order_id": order_id,
-                })
-            except Exception as e:
-                _append_run({
-                    "when": _now_iso(), "symbol": sym, "trigger": "timebox_expired",
-                    "action": "FORCED_EXIT_FAILED",
-                    "error": str(e),
-                })
-            ledger.pop(sym, None)
-            changed = True
-    if changed:
-        write_ledger(ledger)
+            pass
+
+    # fallback: just return a truncated version of the whole raw
+    return text.replace("\n", " ")[:400]
+
+
+def _append_run_log(entry: Dict[str, Any]) -> None:
+    try:
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            import json as _json
+
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 def run_once(
     symbol: str,
-    is_crypto: bool = False,
-    trigger: str = "bar_close_30m",
-    news_boost: bool = False
+    is_crypto: bool,
+    trigger: str,
+    news_boost: bool = False,
 ) -> Dict[str, Any]:
     """
-    One full decision cycle for a symbol.
+    Single autonomous run for one symbol (stock or crypto).
+
+    - Builds data snapshot (short/mid/long)
+    - Builds semantic memory (news for stocks, crypto news for crypto)
+    - Asks Short/Mid/Long agents to vote
+    - Debates the votes into one decision (action + horizon)
+    - Applies risk policy to turn it into an executable action
+    - Logs to state/auto_runs.jsonl
+    - RETURNS the final record (dict) which run_scheduler prints
     """
-    sym = symbol.upper()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    print(f"\n[run_once] ===== RUN START for {sym} (is_crypto={is_crypto}, trigger={trigger}) =====")
+    print(f"[run_once] ===== RUN START for {symbol} (is_crypto={is_crypto}, trigger={trigger}) =====")
 
-    # toolbelt
-    trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
+    # --- debug: show which Gemini key is being used this run ---
+    from os import getenv
 
-    # 1) enforce timeboxes first
-    enforce_timeboxes(trader)
+    k = (getenv("GEMINI_API_KEY") or "").strip()
+    if k:
+        print(f"[run_once] Gemini key fingerprint: {k[:4]}...{k[-4:]}")
 
-    # 2) data + agents
+    # --- shared tools ---
     dm = DataManager()
+    sm = SemanticMemory()
+    fh = FinnhubClient(api_key=settings.finnhub_key) if settings.finnhub_key else None
+    llm = LCTraderLLM(api_key=settings.gemini_key or getenv("GEMINI_API_KEY"))
+    debate = Debate(enter_th=settings.mean_confidence_to_act,
+                    exit_th=settings.exit_confidence_to_act)
 
-    # SAFE semantic memory init — never let this crash the job
+    # --- build price snapshot ---
+    if is_crypto:
+        snapshot = dm.layered_snapshot_crypto(symbol)
+    else:
+        snapshot = dm.layered_snapshot(symbol)
+
+    if snapshot["mid_term"].empty:
+        record = {
+            "when": now,
+            "symbol": symbol,
+            "trigger": trigger,
+            "decision": {
+                "action": "HOLD",
+                "target_horizon": None,
+                "confidence": 0.0,
+                "scores": {"short": 0.0, "mid": 0.0, "long": 0.0},
+            },
+            "action": "HOLD",
+            "reason": "No data available.",
+        }
+        _append_run_log(record)
+        return record
+
+    # --- build semantic memory ---
+    print("[run_once] Building semantic memory…")
     try:
-        sm = SemanticMemory()
+        if is_crypto:
+            if fh:
+                sm.add((fh.crypto_news(max_items=50) or [])[:30])
+        else:
+            if fh:
+                sm.add((fh.company_news(symbol, days=45) or [])[:30])
     except Exception as e:
-        print(f"[run_once] SemanticMemory init failed: {e} — continuing without it.")
-        sm = None
+        print(f"[run_once] News unavailable: {e}")
 
-    # LLM with current Gemini key
-    llm = LCTraderLLM(model=settings.gemini_model, api_key=settings.gemini_key)
-
-    # DEBUG: which Gemini key is this run using?
-    try:
-        print(f"[run_once] Gemini key fingerprint: {llm.debug_key_fingerprint()}")
-    except Exception as e:
-        print(f"[run_once] Could not get Gemini key fingerprint: {e}")
-
-    debate = Debate(
-        enter_th=settings.mean_confidence_to_act,
-        exit_th=settings.exit_confidence_to_act
-    )
-
-    snap = dm.layered_snapshot_crypto(sym) if is_crypto else dm.layered_snapshot(sym)
+    # --- agents ---
+    from agents.short_term_agent import ShortTermAgent
+    from agents.mid_term_agent import MidTermAgent
+    from agents.long_term_agent import LongTermAgent
 
     short = ShortTermAgent("ShortTerm", llm, {})
-    mid   = MidTermAgent("MidTerm", llm, {})
-    long_ = LongTermAgent("LongTerm", llm, {}, sm)
+    mid = MidTermAgent("MidTerm", llm, {})
+    long = LongTermAgent("LongTerm", llm, {}, sm)
 
-    # --- Agent votes + debug logging ---
     votes: List[Dict[str, Any]] = []
-    for agent in (short, mid, long_):
-        d, c, raw = agent.vote(snap)
-        v = {"agent": agent.name, "decision": d, "confidence": float(c), "raw": raw}
-        votes.append(v)
 
-    print(f"[run_once] Votes for {sym} (trigger={trigger}):")
+    # Short-term vote
+    s_dec, s_conf, s_raw = short.vote(snapshot)
+    votes.append({"agent": "ShortTerm", "decision": s_dec, "confidence": s_conf, "raw": s_raw})
+
+    # Mid-term vote
+    m_dec, m_conf, m_raw = mid.vote(snapshot)
+    votes.append({"agent": "MidTerm", "decision": m_dec, "confidence": m_conf, "raw": m_raw})
+
+    # Long-term vote
+    l_dec, l_conf, l_raw = long.vote(snapshot)
+    votes.append({"agent": "LongTerm", "decision": l_dec, "confidence": l_conf, "raw": l_raw})
+
+    # --- DEBUG: print what the LLM is thinking for each agent ---
+    print(f"[run_once] Votes for {symbol} (trigger={trigger}):")
     for v in votes:
-        raw_preview = str(v["raw"])
-        if len(raw_preview) > 300:
-            raw_preview = raw_preview[:300] + "..."
-        print(
-            f"  - {v['agent']}: {v['decision']} (conf={v['confidence']:.2f})\n"
-            f"    rationale: {raw_preview}"
-        )
+        rat = _extract_rationale(v.get("raw", "") or "")
+        print(f"  - {v['agent']}: {v['decision']} (conf={v['confidence']:.2f})")
+        if rat:
+            # indent rationale nicely
+            from textwrap import fill
 
-    decision = debate.horizon_decide(votes)
-    reason = summarize_reason_2lines(votes, decision)
+            wrapped = fill(rat, width=100, subsequent_indent=" " * 8)
+            print(f"    rationale: {wrapped}")
+        else:
+            print("    rationale: (none / LLM unavailable)")
 
-    # DEBUG: final ensemble decision
-    try:
-        print(
-            f"[run_once] Final decision for {sym}: "
-            f"{decision.get('action')} "
-            f"(horizon={decision.get('target_horizon')}, "
-            f"conf={float(decision.get('confidence', 0.0)):.2f})"
-        )
-    except Exception:
-        print(f"[run_once] Final decision for {sym}: {decision}")
+    # --- debate ---
+    decision_obj = debate.horizon_decide(votes)
+    # decision_obj = {"action","target_horizon","confidence","scores":{short,mid,long}}
 
-    # 3) account & exposure
-    acct = trader.account_balances()
-    cash = acct["cash"]; equity = acct["equity"]
+    # extra logging: explain horizon choice + scores
+    scores = decision_obj.get("scores", {}) or {}
+    print(
+        f"[run_once] Debate result for {symbol}: "
+        f"{decision_obj.get('action','HOLD')} "
+        f"(horizon={decision_obj.get('target_horizon')}, "
+        f"conf={float(decision_obj.get('confidence', 0.0)):.3f}, "
+        f"scores={scores})"
+    )
 
-    # Primary price source = Alpaca; fallback to the snapshot's latest close
-    alpaca_px = trader.last_price(sym)
-    snap_px = None
-    try:
-        st = snap.get("short_term")
-        if st is not None and not st.empty and "close" in st.columns:
-            snap_px = float(st["close"].iloc[-1])
-    except Exception:
-        snap_px = None
-    last = float(alpaca_px or 0.0) or float(snap_px or 0.0)  # fallback if Alpaca returns None/0
-
+    # --- apply risk policy / position logic ---
+    trader = AlpacaTrader(settings.alpaca_key, settings.alpaca_secret, settings.alpaca_base_url)
     ledger = read_ledger()
-    held_qty_ledger = float((ledger.get(sym, {}) or {}).get("qty", 0.0))
-    symbol_mv = (last * held_qty_ledger) if last and held_qty_ledger else 0.0
+    sym_key = symbol  # ledger key uses display symbol (e.g. BTC/USD)
 
-    # 4) SELL: execute if either ledger or broker shows qty > 0
-    if decision["action"] == "SELL":
-        held_qty_broker = trader.position_qty(sym)
-        if (held_qty_ledger > 0.0) or (held_qty_broker > 0.0):
+    # current position (ledger + broker)
+    broker_pos = trader.position_qty(symbol)
+    ledger_pos = float(ledger.get(sym_key, 0.0))
+    combined_pos = broker_pos + ledger_pos
+
+    final_action = decision_obj.get("action", "HOLD")
+    horizon = decision_obj.get("target_horizon")
+    conf = float(decision_obj.get("confidence", 0.0))
+
+    # compute buy/sell quantity based on risk limits
+    qty = 0.0
+    order_id: Optional[str] = None
+    reason_tail = ""
+
+    if final_action == "BUY":
+        max_notional = compute_allowed_notional(trader, symbol, horizon or "short")
+        qty = trader.notional_to_qty(symbol, max_notional)
+
+        qty = clamp_qty_by_share_caps(trader, symbol, qty)
+        if qty <= 0:
+            final_action = "HOLD"
+            reason_tail = " (qty calculated as 0 after caps)"
+        elif too_soon_since_last_buy(sym_key):
+            final_action = "HOLD"
+            reason_tail = " (rebuy cooldown not elapsed)"
+        elif hit_daily_buy_limit(sym_key):
+            final_action = "HOLD"
+            reason_tail = " (daily buy limit reached)"
+        else:
             try:
-                order_id = trader.close_position(sym)
-                if sym in ledger:
-                    ledger.pop(sym, None)
-                    write_ledger(ledger)
-                line = {
-                    "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                    "decision": decision, "action": "SELL",
-                    "reason": reason + f" (pre-sell qty: ledger={held_qty_ledger:.8f}, broker={held_qty_broker:.8f})",
-                    "order_id": order_id,
-                    "account": trader.account_balances(),
-                }
-                _append_run(line)
-                return line
+                order_id = trader.market_buy(symbol, qty)
+                ledger[sym_key] = ledger_pos + qty
             except Exception as e:
-                line = {
-                    "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                    "decision": decision, "action": "SELL_FAILED", "error": str(e)
-                }
-                _append_run(line)
-                return line
+                final_action = "HOLD"
+                reason_tail = f" (BUY failed: {e})"
+
+    elif final_action == "SELL":
+        if combined_pos <= 0:
+            # we don't own it – log as SELL_NO_POSITION
+            final_action = "SELL_NO_POSITION"
         else:
-            line = {
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SELL_NO_POSITION",
-                "reason": f"{reason} (no open position: ledger={held_qty_ledger:.8f}, broker={held_qty_broker:.8f})"
-            }
-            _append_run(line)
-            return line
+            qty = combined_pos
+            try:
+                order_id = trader.market_sell(symbol, qty)
+                ledger[sym_key] = max(0.0, ledger_pos - qty)
+            except Exception as e:
+                final_action = "HOLD"
+                reason_tail = f" (SELL failed: {e})"
 
-    # 5) BUY with caps/throttles
-    if decision["action"] == "BUY":
-        horizon = decision.get("target_horizon")
+    write_ledger(ledger)
 
-        # Guard 1: require a valid horizon
-        if horizon not in ("short", "mid", "long"):
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + " (blocked: missing/invalid target_horizon)"
-            })
-            return {"action": "SUGGEST_BUY"}
+    # --- build reason string for log/DB ---
+    reason = (
+        f"Final: {final_action if final_action != 'SELL_NO_POSITION' else 'SELL'} "
+        f"(horizon={horizon or '-'}, conf={conf:.2f}). "
+        f"Votes: "
+        f"S:{s_dec}({s_conf:.2f}) | "
+        f"M:{m_dec}({m_conf:.2f}) | "
+        f"L:{l_dec}({l_conf:.2f})"
+        f"{reason_tail}"
+    )
 
-        # Guard 2: need a working price
-        if last <= 0:
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + f" (blocked: no price; alpaca_px={alpaca_px}, snap_px={snap_px})"
-            })
-            return {"action": "SUGGEST_BUY"}
-
-        # throttles
-        runs = list(reversed(_read_recent_runs(400)))
-        runs_for_symbol = [r for r in runs if r.get("symbol") == sym]
-
-        if hit_daily_buy_limit(sym, runs_for_symbol):
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + " (blocked: daily buy limit)"
-            })
-            return {"action": "SUGGEST_BUY"}
-
-        if too_soon_since_last_buy(sym, runs_for_symbol):
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + f" (blocked: cooldown {settings.REBUY_COOLDOWN_MINUTES}m)"
-            })
-            return {"action": "SUGGEST_BUY"}
-
-        # $ caps
-        notional_allowed = compute_allowed_notional(horizon, cash, equity, symbol_mv)
-        if notional_allowed <= 0:
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + " (blocked: cash/exposure caps)"
-            })
-            return {"action": "SUGGEST_BUY"}
-
-        desired_qty = notional_allowed / last
-        desired_qty = clamp_qty_by_share_caps(desired_qty, held_qty_ledger)
-        if desired_qty <= 0:
-            _append_run({
-                "when": _now_iso(), "symbol": sym, "trigger": trigger,
-                "decision": decision, "action": "SUGGEST_BUY",
-                "reason": reason + " (blocked: share cap reached)"
-            })
-            return {"action": "SUGGEST_BUY"}
-
-        # execute buy (shares) — returns (order_id, filled_qty, avg_px)
-        order_id, filled_qty, avg_px = trader.market_buy_qty(sym, desired_qty)
-
-        # first entry vs add to existing
-        if sym not in ledger:
-            tb_until = set_timebox_on_entry(sym, horizon, filled_qty, avg_px, filled_qty * avg_px)
-        else:
-            merge_entry(ledger, sym, horizon, filled_qty, avg_px, filled_qty * avg_px, reset_timebox=False)
-            write_ledger(ledger)
-            tb_until = ledger.get(sym, {}).get("timebox_until")
-
-        line = {
-            "when": _now_iso(), "symbol": sym, "trigger": trigger,
-            "decision": decision, "action": "BUY",
-            "qty": filled_qty, "entry_price": avg_px,
-            "order_id": order_id, "timebox_until": tb_until,
-            "reason": reason, "account": trader.account_balances(),
-        }
-        _append_run(line)
-        return line
-
-    # 6) HOLD
-    line = {
-        "when": _now_iso(), "symbol": sym, "trigger": trigger,
-        "decision": decision, "action": "HOLD", "reason": reason
+    record: Dict[str, Any] = {
+        "when": now,
+        "symbol": symbol,
+        "trigger": trigger,
+        "decision": {
+            "action": final_action if final_action != "SELL_NO_POSITION" else "SELL",
+            "target_horizon": horizon,
+            "confidence": round(conf, 3),
+            "scores": scores,
+        },
+        "action": final_action,
+        "reason": reason,
+        "qty": qty if qty else None,
+        "order_id": order_id or None,
     }
-    _append_run(line)
-    return line
+
+    _append_run_log(record)
+    print(record)
+    return record

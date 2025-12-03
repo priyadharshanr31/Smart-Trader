@@ -92,13 +92,34 @@ def _parse_vote(text: str) -> Tuple[str, float]:
 
 def _gen_content(model_name: str, system_msg: str, user_text: str) -> str:
     """
-    Gemini 2.x: put the prompt in system_instruction at model construction,
-    then pass a single user string to generate_content().
-    """
-    model = genai.GenerativeModel(model_name, system_instruction=system_msg)
-    resp = model.generate_content(user_text)
+    Generate text from the Gemini API.
 
-    # Standard path
+    Historically, we passed the system prompt via the `system_instruction` argument
+    on the `GenerativeModel` constructor.  However, some models and API keys
+    reject requests containing system instructions (returning a 403 error
+    indicating a leaked or unauthorized key).  To improve robustness, we
+    instead concatenate the system message and user text into a single string
+    and supply it as the sole input to `generate_content()`.  This avoids
+    system-instruction restrictions while preserving the full context for
+    prompt engineering.
+    """
+    try:
+        model = genai.GenerativeModel(model_name)
+    except Exception:
+        # In case model instantiation fails, return empty string
+        return ""
+
+    # Combine system message and user text.  If either is blank, skip the separator.
+    combined_parts: List[str] = []
+    if system_msg:
+        combined_parts.append(system_msg)
+    if user_text:
+        combined_parts.append(user_text)
+    combined_prompt = "\n\n".join(combined_parts)
+
+    resp = model.generate_content(combined_prompt)
+
+    # Standard path: resp.text is populated on modern SDKs
     if getattr(resp, "text", None):
         return resp.text
 
@@ -116,9 +137,8 @@ class LCTraderLLM:
     """
 
     def __init__(self, model: str | None = None, api_key: Optional[str] = None, **_: Any):
-        # Configure Gemini client and remember which key was used for this instance.
-        # This is useful for debugging when multiple keys/environments are in play.
-        self.api_key_used: str = _configure_genai(api_key)
+        # configure Gemini client
+        _configure_genai(api_key)
 
         # call order with fallbacks
         self.model_chain: List[str] = []
@@ -127,18 +147,6 @@ class LCTraderLLM:
         for m in FALLBACK_MODELS:
             if m not in self.model_chain:
                 self.model_chain.append(m)
-
-    def debug_key_fingerprint(self) -> str:
-        """
-        Helper for logging: return a short fingerprint of the API key so you
-        can see which key is being used without dumping the whole secret.
-
-        Example output: 'AIza...9QkL'.
-        """
-        k = self.api_key_used or ""
-        if len(k) <= 8:
-            return k
-        return f"{k[:4]}...{k[-4:]}"
 
     def vote_structured(
         self,

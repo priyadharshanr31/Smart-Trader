@@ -21,7 +21,10 @@ USER_TMPL = (
 REQ_COLS = ["close", "rsi", "macd", "macd_signal", "upper_band", "lower_band"]
 
 class MidTermAgent(BaseAgent):
-    MIN_ROWS = 120
+    # Minimum number of rows for mid‑term agent.  Lowered from 120 to 80 to
+    # accommodate assets with shorter daily histories while still giving
+    # adequate data for moving average calculations.
+    MIN_ROWS = 80
     TAIL_N = 20
 
     def vote(self, snapshot: Dict[str, Any]) -> Tuple[str, float, str]:
@@ -55,5 +58,47 @@ class MidTermAgent(BaseAgent):
         except Exception:
             conf = 0.5
         conf = max(0.0, min(1.0, conf))
+
+        # ---------------------------------------------------------------
+        # Fallback heuristic for mid‑term: If the LLM returns HOLD with
+        # confidence ≤0.5, derive a basic trend signal using moving
+        # averages.  A simple 5‑day vs 20‑day moving average crossover is
+        # computed on the full mid‑term dataframe.  If the short MA is
+        # above the long MA and the slope is positive, we BUY; if the
+        # short MA is below the long MA and the slope is negative, we
+        # SELL; otherwise we HOLD with lower confidence.  Confidence
+        # scales with the relative distance between the MAs.
+        if decision.upper() == "HOLD" and conf <= 0.5:
+            try:
+                close = df['close']
+                ma5_series = close.rolling(window=5).mean()
+                ma20_series = close.rolling(window=20).mean()
+                ma5_last = float(ma5_series.iloc[-1])
+                ma20_last = float(ma20_series.iloc[-1])
+                # compute simple slope over last 5 periods
+                ma5_prev = float(ma5_series.iloc[-5]) if len(ma5_series) >= 5 else ma5_last
+                ma20_prev = float(ma20_series.iloc[-5]) if len(ma20_series) >= 5 else ma20_last
+                slope5 = ma5_last - ma5_prev
+                slope20 = ma20_last - ma20_prev
+                buy_signal = False
+                sell_signal = False
+                if (ma5_last > ma20_last) and (slope5 > 0 or slope20 > 0):
+                    buy_signal = True
+                if (ma5_last < ma20_last) and (slope5 < 0 or slope20 < 0):
+                    sell_signal = True
+                if buy_signal and not sell_signal:
+                    decision = "BUY"
+                    distance = abs(ma5_last - ma20_last) / (ma20_last + 1e-9)
+                    conf = min(1.0, 0.5 + distance * 2.0)
+                elif sell_signal and not buy_signal:
+                    decision = "SELL"
+                    distance = abs(ma5_last - ma20_last) / (ma20_last + 1e-9)
+                    conf = min(1.0, 0.5 + distance * 2.0)
+                else:
+                    decision = "HOLD"
+                    conf = 0.4
+                raw = f"{raw} [fallback_heuristic_midterm]"
+            except Exception:
+                pass
 
         return decision, conf, raw
